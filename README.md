@@ -143,6 +143,12 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 
 当前 Skill 与插件版本为 `1.6.0`。
 
+## 开源协议
+
+本项目采用 [MIT License](LICENSE) 开源。你可以自由使用、复制、修改、合并、
+发布和分发本项目，但需要保留原始版权声明和许可证文本。软件按“原样”提供，
+不附带任何明示或暗示的担保。
+
 ## 相关项目
 
 - [MiriaGo](https://github.com/BilyHurington/MiriaGo)：本 Skill 输出数据包所对应的
