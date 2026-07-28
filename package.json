@@ -1,0 +1,17 @@
+{
+  "name": "miriago-route-planner-skill",
+  "version": "1.6.0",
+  "description": "Agent Skill for importing pilgrimage points, reviewing routes and journey notes, and exporting MiriaGo v2 packages in Codex, Pi, and Claude Code.",
+  "keywords": [
+    "pi-package",
+    "agent-skill",
+    "miriago",
+    "anitabi",
+    "pilgrimage"
+  ],
+  "pi": {
+    "skills": [
+      "./plan-miriago-route"
+    ]
+  }
+}

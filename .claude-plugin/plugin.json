@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "miriago-route-planner-skill",
+  "displayName": "MiriaGo Route Planner Skill",
+  "version": "1.6.0",
+  "description": "Import pilgrimage points, review routes and journey notes, and export MiriaGo v2 packages.",
+  "author": {
+    "name": "MiriaGo Route Planner contributors"
+  },
+  "keywords": [
+    "miriago",
+    "anitabi",
+    "pilgrimage",
+    "route-planning"
+  ],
+  "skills": "./"
+}
