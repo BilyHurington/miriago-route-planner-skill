@@ -147,9 +147,21 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 
 本项目采用 [MIT License](LICENSE) 开源。你可以自由使用、复制、修改、合并、
 发布和分发本项目，但需要保留原始版权声明和许可证文本。软件按“原样”提供，
-不附带任何明示或暗示的担保。
+不附带任何明示或暗示的担保。MIT 协议仅适用于本仓库代码和文档，不包含第三方
+数据或用户导入内容。
 
 ## 相关项目
 
 - [MiriaGo](https://github.com/BilyHurington/MiriaGo)：本 Skill 输出数据包所对应的
   巡礼计划应用。
+
+## 数据来源说明
+
+本项目在用户选择相应功能时，可能使用或处理来自
+[Bangumi](https://bgm.tv/)、[Anitabi](https://anitabi.cn/)、
+[Google My Maps](https://www.google.com/maps/about/mymaps/)、
+[OpenStreetMap](https://www.openstreetmap.org/copyright) 和
+[Valhalla](https://github.com/valhalla/valhalla) 的公开数据，以及用户主动提供的
+MiriaGo 数据包、KML/KMZ、图片和来源页面。第三方数据、图片和商标的权利归各自
+权利人所有，不受本仓库 MIT License 授权。使用者应遵守对应来源的许可协议、
+服务条款和署名要求，并自行确认导入、下载、再分发及实际使用这些内容的权限。
