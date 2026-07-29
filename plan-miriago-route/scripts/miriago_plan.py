@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -55,6 +56,7 @@ from miriago_planner.proposal import (
 from miriago_planner.public_services import (
     DEFAULT_OVERPASS_ENDPOINT,
     DEFAULT_VALHALLA_ENDPOINT,
+    DEFAULT_VALHALLA_ROUTE_ENDPOINT,
     JsonCache,
     PublicServiceError,
     fetch_stations,
@@ -67,6 +69,11 @@ from miriago_planner.reference_images import (
     MAX_IMAGE_DOWNLOAD_WORKERS,
     ReferenceImageError,
     bundle_reference_images,
+)
+from miriago_planner.route_preview import (
+    GEOMETRY_MODES,
+    RoutePreviewError,
+    render_route_preview,
 )
 from miriago_planner.source_import import (
     ImportProposalError,
@@ -310,6 +317,35 @@ def build_parser() -> argparse.ArgumentParser:
     refine_parser.add_argument("--cache-dir")
     refine_parser.add_argument("--force", action="store_true")
     refine_parser.set_defaults(handler=_refine)
+
+    preview_parser = subparsers.add_parser(
+        "render-preview",
+        help="Render a single-file interactive area and route preview.",
+    )
+    preview_parser.add_argument("input")
+    preview_parser.add_argument("proposal")
+    preview_parser.add_argument("--output", required=True)
+    preview_parser.add_argument(
+        "--geometry",
+        choices=tuple(sorted(GEOMETRY_MODES)),
+        default="auto",
+        help=(
+            "Route geometry mode. auto uses Valhalla only for explicitly approved "
+            "and successfully evaluated groups."
+        ),
+    )
+    preview_parser.add_argument(
+        "--no-basemap",
+        action="store_true",
+        help="Render routes and points without loading an online basemap.",
+    )
+    preview_parser.add_argument(
+        "--valhalla-route-endpoint",
+        default=DEFAULT_VALHALLA_ROUTE_ENDPOINT,
+    )
+    preview_parser.add_argument("--cache-dir")
+    preview_parser.add_argument("--force", action="store_true")
+    preview_parser.set_defaults(handler=_render_preview)
 
     apply_parser = subparsers.add_parser(
         "apply", help="Apply a completed proposal to a new .sjhplan package."
@@ -795,6 +831,38 @@ def _refine(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _render_preview(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    proposal_path = Path(args.proposal).expanduser().resolve()
+    proposal = load_proposal(proposal_path)
+    proposal_sha256 = hashlib.sha256(proposal_path.read_bytes()).hexdigest()
+    result = render_route_preview(
+        package,
+        proposal,
+        proposal_path=proposal_path,
+        proposal_sha256=proposal_sha256,
+        output=args.output,
+        geometry_mode=args.geometry,
+        no_basemap=args.no_basemap,
+        route_endpoint=args.valhalla_route_endpoint,
+        cache=JsonCache(args.cache_dir),
+        force=args.force,
+        progress=_emit_route_preview_progress,
+    )
+    return {
+        "status": "route_preview_created",
+        "output": str(result.output),
+        "geometryMode": args.geometry,
+        "noBasemap": args.no_basemap,
+        "groups": result.groups,
+        "routedGroups": result.routed_groups,
+        "fallbackGroups": result.fallback_groups,
+        "excludedPoints": result.excluded_points,
+        "unlocatedPoints": result.unlocated_points,
+        "warnings": list(result.warnings),
+    }
+
+
 def _apply(args: argparse.Namespace) -> dict[str, Any]:
     package = load_package(args.input)
     proposal = load_proposal(args.proposal)
@@ -878,6 +946,14 @@ def _emit_image_download_progress(event: dict[str, Any]) -> None:
     )
 
 
+def _emit_route_preview_progress(event: dict[str, Any]) -> None:
+    print(
+        json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -891,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
         ProposalError,
         PublicServiceError,
         ReferenceImageError,
+        RoutePreviewError,
         SourceImportError,
         OSError,
         ValueError,

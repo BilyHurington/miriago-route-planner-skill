@@ -13,6 +13,7 @@ Maps、KML/KMZ 或已有 `.sjhplan` 数据包收集点位，经过逐步确认�
 - 下载并整合公开 Google My Maps 数据或本地 KML/KMZ 文件。
 - 在不覆盖源文件的前提下扩展已有 MiriaGo v2 数据包。
 - 将点位划分为可复核的地理片区，并规划各片区内的巡礼顺序。
+- 生成单文件交互式 HTML 预览，显示每个片区的路线、编号点位、取舍点和无效坐标。
 - 可选用公共 Valhalla 路网精确评估步行路线。
 - 记录点位取舍和路线时长调整，同时保留原始点位，方便撤销和追溯。
 - 将片区间交通、预计步行时间和注意事项写入 MiriaGo 计划备注。
@@ -111,6 +112,17 @@ Agent 会先询问缺失的计划信息，然后依次确认：是否使用步�
 python3 plan-miriago-route/scripts/miriago_plan.py --help
 ```
 
+在片区或路线复核前可生成交互式预览：
+
+```bash
+python3 plan-miriago-route/scripts/miriago_plan.py render-preview \
+  INPUT.sjhplan PROPOSAL.json --output routes-preview.html --geometry auto
+```
+
+`auto` 只会在用户已明确同意步行路网评估，且当前片区已成功评估时
+请求 Valhalla 真实线形；其他情况会明确显示直线降级。加上 `--no-basemap`
+可在打开 HTML 时不请求在线底图。预览生成进度会以 JSONL 输出到 stderr。
+
 参考图片默认使用 8 个线程下载。生成数据包的命令支持
 `--image-download-workers 1-32`；需要严格复现请求顺序时可设为 1。下载进度会
 实时刷新到 stderr，最终机器可读结果仍单独输出到 stdout。
@@ -119,7 +131,7 @@ python3 plan-miriago-route/scripts/miriago_plan.py --help
 
 - Python 3.10 或更高版本
 - 生成非 Anitabi 图片缩略图时需要 Pillow
-- 使用 Bangumi、Anitabi、Google My Maps、Overpass 或 Valhalla 功能时需要
+- 使用 Bangumi、Anitabi、Google My Maps、Overpass、Valhalla 或在线底图时需要
   公共网络访问
 
 安装图片处理依赖：
@@ -141,7 +153,7 @@ ruff check scripts tests
 PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 ```
 
-当前 Skill 与插件版本为 `1.6.0`。
+当前 Skill 与插件版本为 `1.7.0`。
 
 ## 开源协议
 
@@ -149,6 +161,9 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 发布和分发本项目，但需要保留原始版权声明和许可证文本。软件按“原样”提供，
 不附带任何明示或暗示的担保。MIT 协议仅适用于本仓库代码和文档，不包含第三方
 数据或用户导入内容。
+
+交互预览内嵌 MapLibre GL JS 5.24.0，其 BSD-3-Clause 及所含组件许可文本
+保存在 `plan-miriago-route/assets/route-preview/vendor/LICENSE.txt`。
 
 ## 相关项目
 
@@ -161,7 +176,8 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 [Bangumi](https://bgm.tv/)、[Anitabi](https://anitabi.cn/)、
 [Google My Maps](https://www.google.com/maps/about/mymaps/)、
 [OpenStreetMap](https://www.openstreetmap.org/copyright) 和
-[Valhalla](https://github.com/valhalla/valhalla) 的公开数据，以及用户主动提供的
+[Valhalla](https://github.com/valhalla/valhalla) 的公开数据，并可在预览中加载
+[OpenFreeMap](https://openfreemap.org/) 底图，以及用户主动提供的
 MiriaGo 数据包、KML/KMZ、图片和来源页面。第三方数据、图片和商标的权利归各自
 权利人所有，不受本仓库 MIT License 授权。使用者应遵守对应来源的许可协议、
 服务条款和署名要求，并自行确认导入、下载、再分发及实际使用这些内容的权限。

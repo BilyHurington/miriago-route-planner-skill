@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 DEFAULT_USER_AGENT = (
-    "plan-miriago-route/1.6 "
+    "plan-miriago-route/1.7 "
     "(https://github.com/bilyhurington/MiriaGo)"
 )
 

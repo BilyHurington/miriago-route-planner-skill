@@ -1,6 +1,6 @@
 ---
 name: plan-miriago-route
-description: Collect, merge, review, and plan MiriaGo v2 pilgrimage data. Use when an AI coding agent needs to create or extend a `.sjhplan` package from a Bangumi work name, Anitabi points, a public Google My Maps link, KML/KMZ, or an existing MiriaGo package; divide points into practical areas; review boundaries; evaluate pedestrian road-network routes; make auditable time-based point tradeoffs; write reviewed transport, walking-time, and caution notes into the plan memo; bundle reference images; or write an importable MiriaGo package. Enforce explicit user approval at the input, Bangumi selection, source import, area, route-policy, journey-note, route, and export-image checkpoints.
+description: Collect, merge, review, visualize, and plan MiriaGo v2 pilgrimage data. Use when an AI coding agent needs to create or extend a `.sjhplan` package from a Bangumi work name, Anitabi points, a public Google My Maps link, KML/KMZ, or an existing MiriaGo package; divide points into practical areas; render interactive area and route previews; evaluate pedestrian road-network routes; make auditable time-based point tradeoffs; write reviewed transport, walking-time, and caution notes into the plan memo; bundle reference images; or write an importable MiriaGo package. Enforce explicit user approval at the input, Bangumi selection, source import, area, route-policy, journey-note, route, and export-image checkpoints.
 ---
 
 # Plan MiriaGo Route
@@ -71,6 +71,9 @@ corresponding `confirm-*` command only after explicit user approval. The require
 - Keep `apply-import` and `apply` attached until they finish. Monitor their
   JSONL image-download events on stderr and relay useful progress during a long
   export. Read only the final command result from stdout.
+- Treat route previews as review aids inside the existing area and route gates,
+  not as new approval gates. Keep every preview output distinct from both its
+  input package and proposal.
 
 ## 0. Pass the input gate
 
@@ -189,9 +192,19 @@ Read [planning-policy.md](references/planning-policy.md) for boundary review and
 [public-services.md](references/public-services.md) before using online data.
 
 Review every group: replace placeholder names, inspect low-confidence edges,
-confirm membership, and choose a point/station/custom anchor. Present every
-area's name, point count, anchor, notable boundary decisions, and all unassigned
-points. **Stop at the area gate.** Do not reorder routes or call `refine` yet.
+confirm membership, and choose a point/station/custom anchor. Render the edited
+area draft before presenting it:
+
+```bash
+python3 <skill-directory>/scripts/miriago_plan.py render-preview \
+  INPUT.sjhplan WORK/areas-draft.json \
+  --geometry straight --output WORK/areas-preview.html
+```
+
+Present the preview path plus every area's name, point count, anchor, notable
+boundary decisions, and all unassigned points. The area preview uses visit-order
+straight lines because road-network use has not been approved yet. **Stop at the
+area gate.** Do not reorder routes or call `refine` yet.
 
 After explicit area approval, record it:
 
@@ -301,8 +314,28 @@ Any later membership, order, route-metric, or exclusion change makes the notes
 stale. Regenerate and review them instead of bypassing the fingerprint error.
 When note writing was declined, skip both note commands.
 
-Present the final route, tradeoffs, and approved note status. **Stop at the route
-gate.** Do not combine a request for approval with route confirmation.
+Render the final review proposal before presenting the route. Use
+`notes-confirmed.json` when notes were requested, otherwise use the stable final
+route draft:
+
+```bash
+python3 <skill-directory>/scripts/miriago_plan.py render-preview \
+  INPUT.sjhplan WORK/FINAL-REVIEW-PROPOSAL.json \
+  --geometry auto --output WORK/routes-preview.html
+```
+
+`auto` fetches pedestrian route shapes only when road-network use was explicitly
+approved and the group's current evaluation is `routed`. Otherwise it draws an
+explicit dashed straight-line fallback. The HTML shows numbered points, area
+routes, red-cross excluded points, skipped/failed route states, and a sidebar
+list for invalid coordinates. It intentionally omits exclusion reasons, full
+notes, images, links, and detailed diagnostics; include those in the written
+review instead. Use `--no-basemap` when the preview must avoid online map tiles.
+
+Present the preview path, final route, tradeoffs with their approved reasons,
+and approved note status. The preview does not add a new confirmation gate.
+**Stop at the route gate.** Do not combine a request for approval with route
+confirmation.
 
 After explicit approval, record it:
 
@@ -364,6 +397,12 @@ package or preservation failures.
   `image_download_progress`, and `image_download_complete` JSON events on
   stderr. A progress event on stderr is informational unless its `status` is
   `failed`; stdout remains reserved for the final result.
+- While route geometry renders, monitor `route_preview_start`,
+  `route_geometry_progress`, and `route_preview_complete` on stderr. A failed
+  geometry job produces a visible fallback and a warning without blocking the
+  HTML file.
+- If an online preview basemap is unavailable or must not be requested,
+  regenerate with `--no-basemap`; route and point interaction remains available.
 - Install `scripts/requirements.txt` before exporting non-Anitabi images when
   Pillow is unavailable; it is required to generate actual thumbnails.
 - Use `--force` only when the user explicitly intends to replace that output;

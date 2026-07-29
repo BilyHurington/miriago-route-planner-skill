@@ -565,6 +565,62 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be between 1 and 32", result.stderr)
 
+    def test_render_preview_keeps_progress_separate_from_final_json(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = root / "scripts" / "miriago_plan.py"
+        with tempfile.TemporaryDirectory() as directory_value:
+            directory = Path(directory_value)
+            source = write_package(
+                directory / "source.sjhplan",
+                [
+                    point("a", 35.68, 139.76),
+                    point("b", 35.681, 139.761),
+                ],
+            )
+            proposal = directory / "proposal.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "propose",
+                    str(source),
+                    "--output",
+                    str(proposal),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            output = directory / "routes-preview.html"
+            rendered = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "render-preview",
+                    str(source),
+                    str(proposal),
+                    "--output",
+                    str(output),
+                    "--geometry",
+                    "straight",
+                    "--no-basemap",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            final = json.loads(rendered.stdout)
+            self.assertEqual(final["status"], "route_preview_created")
+            self.assertTrue(final["noBasemap"])
+            events = [json.loads(line) for line in rendered.stderr.splitlines()]
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["route_preview_start", "route_preview_complete"],
+            )
+            html = output.read_text(encoding="utf-8")
+            self.assertIn('"noBasemap":true', html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,23 @@ After a tradeoff, recompute the affected group's local metrics and repeat road
 evaluation when it was requested. The final report must list all excluded points
 and reasons so the decision remains reversible and auditable.
 
+## Interactive preview interpretation
+
+Render an area preview before area confirmation and a final route preview before
+route confirmation. These files support the existing gates and do not authorize
+any decision themselves.
+
+- Solid colored lines are fetched pedestrian route shapes for current `routed`
+  evaluations.
+- Gray dashed lines are visit-order straight-line approximations.
+- Orange dashed lines mark unavailable road geometry or failed evaluation.
+- Red crosses identify excluded points without exposing their stored reasons.
+- The sidebar lists invalid or pending-coordinate points that cannot be mapped.
+
+The compact HTML intentionally omits notes, images, source links, exclusion
+reasons, and service diagnostics. Keep the full written gate report authoritative.
+Regenerate the preview after membership, order, evaluation, or exclusion changes.
+
 ## Agent review cues
 
 Review a group more carefully when:

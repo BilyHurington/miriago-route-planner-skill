@@ -1,6 +1,6 @@
 # Public services and fair use
 
-Both integrations require no API key. Overpass station lookup is optional.
+These integrations require no API key. Overpass station lookup is optional.
 Valhalla route evaluation is conditional on the user's explicit route-policy
 choice and becomes required for the reviewed groups when that choice is `yes`.
 
@@ -33,9 +33,13 @@ Never:
 
 ## FOSSGIS Valhalla demo
 
-Default endpoint:
+Default matrix endpoint:
 
 `https://valhalla1.openstreetmap.de/sources_to_targets`
+
+Default route-shape endpoint:
+
+`https://valhalla1.openstreetmap.de/route`
 
 The integration sends a pedestrian many-to-many matrix for one reviewed group,
 sets `X-Client-Id: plan-miriago-route`, converts Valhalla's default
@@ -43,6 +47,13 @@ kilometre distances to metres, and caches the result for seven days.
 It normally uses Python's HTTPS client; on older macOS system Python builds
 whose LibreSSL cannot negotiate with the demo server, it can fall back to the
 system `curl` transport. If neither transport works, local ordering remains.
+
+After matrix ordering has been reviewed, `render-preview --geometry auto` may
+send that ordered group to the route endpoint to obtain a pedestrian polyline6
+shape. This call supplies display geometry only; it never changes membership or
+order. Successful route responses use the same seven-day cache. A route-shape
+failure leaves an orange dashed straight-line fallback in the HTML and does not
+block preview generation.
 
 Valhalla documents the matrix request and result fields in its
 [matrix API reference](https://valhalla.github.io/valhalla/api/matrix/).
@@ -55,6 +66,14 @@ and only for reviewed groups. A failure, rate limit, or disconnected point
 leaves the local order unchanged and must be persisted and shown as `failed`.
 Singletons and groups over the 25-point matrix limit must be persisted and shown
 as `skipped`. Never describe either status as a precise routed result.
+
+## OpenFreeMap preview basemap
+
+Interactive previews use OpenFreeMap's Positron style by default. The generated
+HTML makes tile, style, glyph, and sprite requests only when it is opened in a
+browser. Preserve the attribution displayed by the embedded MapLibre control.
+Use `render-preview --no-basemap` to produce the same route and point interaction
+without requesting an online basemap.
 
 ## Cache and endpoint controls
 

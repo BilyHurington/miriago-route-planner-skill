@@ -22,11 +22,13 @@ from .clustering import haversine_meters, order_open_path
 
 DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
 DEFAULT_VALHALLA_ENDPOINT = "https://valhalla1.openstreetmap.de/sources_to_targets"
-USER_AGENT = "plan-miriago-route/1.6"
+DEFAULT_VALHALLA_ROUTE_ENDPOINT = "https://valhalla1.openstreetmap.de/route"
+USER_AGENT = "plan-miriago-route/1.7"
 VALHALLA_CLIENT_ID = "plan-miriago-route"
 DEFAULT_CACHE_DAYS = 7
 MAX_STATION_BOXES_PER_QUERY = 30
 MAX_WALKING_MATRIX_POINTS = 25
+MAX_WALKING_ROUTE_POINTS = 25
 
 
 class PublicServiceError(RuntimeError):
@@ -44,6 +46,13 @@ class StationResult:
 class WalkingMatrix:
     distances_meters: list[list[float]]
     durations_seconds: list[list[float]]
+    endpoint: str
+    cache_hit: bool
+
+
+@dataclass(frozen=True)
+class WalkingRoute:
+    geojson_coordinates: tuple[tuple[float, float], ...]
     endpoint: str
     cache_hit: bool
 
@@ -469,6 +478,122 @@ def parse_valhalla_matrix(
     distances = _numeric_matrix(raw_distances, size, scale=1_000)
     durations = _numeric_matrix(raw_durations, size, scale=1)
     return distances, durations
+
+
+def fetch_walking_route(
+    locations: Sequence[Mapping[str, Any]],
+    *,
+    endpoint: str = DEFAULT_VALHALLA_ROUTE_ENDPOINT,
+    cache: JsonCache | None = None,
+    timeout_seconds: float = 45,
+    cache_days: int = DEFAULT_CACHE_DAYS,
+    requester: Callable[..., Any] = urlopen,
+) -> WalkingRoute:
+    """Return a pedestrian road shape through locations in their given order."""
+    if not 2 <= len(locations) <= MAX_WALKING_ROUTE_POINTS:
+        raise PublicServiceError(
+            f"Walking route requires 2–{MAX_WALKING_ROUTE_POINTS} locations."
+        )
+    normalized = [
+        {
+            "lat": float(location["latitude"]),
+            "lon": float(location["longitude"]),
+        }
+        for location in locations
+    ]
+    payload = {
+        "locations": normalized,
+        "costing": "pedestrian",
+        "units": "kilometers",
+        "shape_format": "polyline6",
+    }
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    cache_value = cache or JsonCache()
+    cache_key = _cache_key(endpoint, serialized)
+    response = cache_value.get("valhalla-route", cache_key, cache_days)
+    cache_hit = response is not None
+    if response is None:
+        response = _post_json(
+            endpoint,
+            payload,
+            timeout_seconds=timeout_seconds,
+            requester=requester,
+            headers={"X-Client-Id": VALHALLA_CLIENT_ID},
+        )
+        coordinates = parse_valhalla_route(response)
+        cache_value.put("valhalla-route", cache_key, response)
+    else:
+        coordinates = parse_valhalla_route(response)
+    return WalkingRoute(
+        geojson_coordinates=coordinates,
+        endpoint=endpoint,
+        cache_hit=cache_hit,
+    )
+
+
+def parse_valhalla_route(response: Any) -> tuple[tuple[float, float], ...]:
+    if not isinstance(response, Mapping):
+        raise PublicServiceError("Valhalla route response must be an object.")
+    trip = response.get("trip")
+    if not isinstance(trip, Mapping) or not isinstance(trip.get("legs"), list):
+        raise PublicServiceError("Valhalla response has no route legs.")
+    coordinates: list[tuple[float, float]] = []
+    for index, leg in enumerate(trip["legs"]):
+        if not isinstance(leg, Mapping) or not isinstance(leg.get("shape"), str):
+            raise PublicServiceError(f"Valhalla route leg {index} has no shape.")
+        leg_coordinates = _decode_polyline6(leg["shape"])
+        if coordinates and leg_coordinates[0] == coordinates[-1]:
+            coordinates.extend(leg_coordinates[1:])
+        else:
+            coordinates.extend(leg_coordinates)
+    if len(coordinates) < 2:
+        raise PublicServiceError("Valhalla route shape contains fewer than two points.")
+    return tuple(coordinates)
+
+
+def _decode_polyline6(value: str) -> list[tuple[float, float]]:
+    if not value:
+        raise PublicServiceError("Valhalla route shape is empty.")
+    latitude = 0
+    longitude = 0
+    index = 0
+    coordinates: list[tuple[float, float]] = []
+    try:
+        while index < len(value):
+            latitude_delta, index = _decode_polyline_value(value, index)
+            longitude_delta, index = _decode_polyline_value(value, index)
+            latitude += latitude_delta
+            longitude += longitude_delta
+            lat = latitude / 1_000_000
+            lon = longitude / 1_000_000
+            if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise PublicServiceError(
+                    "Valhalla route shape contains an invalid coordinate."
+                )
+            coordinates.append((lon, lat))
+    except (IndexError, ValueError) as exc:
+        raise PublicServiceError("Valhalla route shape is malformed.") from exc
+    if not coordinates:
+        raise PublicServiceError("Valhalla route shape is empty.")
+    return coordinates
+
+
+def _decode_polyline_value(value: str, index: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while True:
+        item = ord(value[index]) - 63
+        index += 1
+        if item < 0:
+            raise ValueError("invalid polyline character")
+        result |= (item & 0x1F) << shift
+        if item < 0x20:
+            break
+        shift += 5
+        if shift > 60:
+            raise ValueError("polyline value is too large")
+    delta = ~(result >> 1) if result & 1 else result >> 1
+    return delta, index
 
 
 def _numeric_matrix(value: Any, size: int, *, scale: float) -> list[list[float]]:

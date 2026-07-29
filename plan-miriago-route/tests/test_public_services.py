@@ -6,12 +6,15 @@ import unittest
 
 from miriago_planner.public_services import (
     JsonCache,
+    PublicServiceError,
     WalkingMatrix,
     build_station_query,
     fetch_stations,
+    fetch_walking_route,
     optimize_walking_order,
     parse_overpass_stations,
     parse_valhalla_matrix,
+    parse_valhalla_route,
     station_boxes_from_proposal,
 )
 
@@ -161,6 +164,64 @@ class PublicServiceTests(unittest.TestCase):
         self.assertEqual(set(order), {"a", "b", "c"})
         self.assertEqual(distance, 200)
         self.assertEqual(duration, 160)
+
+    def test_parse_valhalla_route_decodes_polyline6(self) -> None:
+        coordinates = parse_valhalla_route(
+            {"trip": {"legs": [{"shape": "??AC"}]}}
+        )
+        self.assertEqual(coordinates, ((0.0, 0.0), (0.000002, 0.000001)))
+
+    def test_parse_valhalla_route_joins_leg_boundaries(self) -> None:
+        coordinates = parse_valhalla_route(
+            {
+                "trip": {
+                    "legs": [
+                        {"shape": "??AC"},
+                        {"shape": "ACCC"},
+                    ]
+                }
+            }
+        )
+        self.assertEqual(
+            coordinates,
+            (
+                (0.0, 0.0),
+                (0.000002, 0.000001),
+                (0.000004, 0.000003),
+            ),
+        )
+
+    def test_fetch_walking_route_reuses_successful_cache(self) -> None:
+        calls: list[str] = []
+
+        def requester(request: object, timeout: float) -> _Response:
+            calls.append(str(request))
+            return _Response({"trip": {"legs": [{"shape": "??AC"}]}})
+
+        locations = [
+            {"latitude": 0, "longitude": 0},
+            {"latitude": 0.000001, "longitude": 0.000002},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = JsonCache(directory)
+            first = fetch_walking_route(
+                locations,
+                cache=cache,
+                requester=requester,
+            )
+            second = fetch_walking_route(
+                locations,
+                cache=cache,
+                requester=requester,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        self.assertEqual(first.geojson_coordinates, second.geojson_coordinates)
+
+    def test_parse_valhalla_route_rejects_malformed_shape(self) -> None:
+        with self.assertRaisesRegex(PublicServiceError, "malformed"):
+            parse_valhalla_route({"trip": {"legs": [{"shape": "g"}]}})
 
 
 if __name__ == "__main__":

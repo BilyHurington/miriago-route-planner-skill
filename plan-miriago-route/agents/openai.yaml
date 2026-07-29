@@ -1,4 +1,4 @@
 interface:
-  display_name: "Plan and Import MiriaGo Routes"
-  short_description: "Import, review, annotate, and plan MiriaGo routes"
-  default_prompt: "Use $plan-miriago-route to collect my inputs, stop at every review gate, explicitly ask about pedestrian road-network evaluation, time-based route tradeoffs, and reviewed journey notes, monitor concurrent reference-image download progress, and plan an importable MiriaGo route."
+  display_name: "Plan and Preview MiriaGo Routes"
+  short_description: "Import, preview, review, and plan MiriaGo routes"
+  default_prompt: "Use $plan-miriago-route to collect my pilgrimage inputs, stop at every review gate, generate interactive area and route previews, and export a reviewed MiriaGo package."

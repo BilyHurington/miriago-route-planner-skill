@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob: https:; connect-src https:; worker-src blob:; font-src data: https:;">
+  <title>MiriaGo 路线预览</title>
+  <style>
+/*__MAPLIBRE_CSS__*/
+/*__APPLICATION_CSS__*/
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="title-block">
+        <h1 id="plan-title">MiriaGo 路线预览</h1>
+        <p id="plan-meta"></p>
+      </div>
+      <div class="topbar-actions">
+        <button id="fit-all" class="icon-button" type="button" title="显示全部点位" aria-label="显示全部点位">⌖</button>
+        <button id="toggle-panel" class="icon-button" type="button" title="显示或隐藏片区列表" aria-label="显示或隐藏片区列表">☰</button>
+      </div>
+    </header>
+    <main class="workspace">
+      <aside id="sidebar" class="sidebar" aria-label="片区列表">
+        <div class="sidebar-heading">
+          <div>
+            <h2>片区</h2>
+            <p id="group-count"></p>
+          </div>
+          <label class="binary-control">
+            <input id="toggle-excluded" type="checkbox" checked>
+            <span>取舍点</span>
+          </label>
+        </div>
+        <div id="group-list" class="group-list"></div>
+        <section id="unlocated-section" class="unlocated-section" hidden>
+          <h2>无法定位</h2>
+          <ul id="unlocated-list"></ul>
+        </section>
+        <footer class="preview-integrity">
+          <span id="generated-at"></span>
+          <span id="fingerprint"></span>
+        </footer>
+      </aside>
+      <section class="map-region" aria-label="交互式路线地图">
+        <div id="map"></div>
+        <div id="map-message" class="map-message" hidden></div>
+        <div class="legend" aria-label="地图图例">
+          <span><i class="legend-line routed"></i>步行路网</span>
+          <span><i class="legend-line approximate"></i>访问顺序</span>
+          <span><i class="legend-line failed"></i>路网不可用</span>
+          <span><i class="legend-point excluded"></i>已取舍</span>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script id="preview-data" type="application/json">__PREVIEW_DATA__</script>
+  <script>
+/*__MAPLIBRE_JS__*/
+  </script>
+  <script>
+/*__APPLICATION_JS__*/
+  </script>
+</body>
+</html>
