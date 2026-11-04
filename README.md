@@ -212,8 +212,7 @@ ruff check scripts tests
 PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 ```
 
-当前 Skill 与插件版本为 `2.0.0`。2.0 的流程设计见
-[docs/skill-2.0-设计.md](docs/skill-2.0-设计.md)，各可选模块说明见
+当前 Skill 与插件版本为 `2.0.0`。各可选模块说明见
 `plan-miriago-route/references/optional-modules.md`。
 
 ## 开源协议
