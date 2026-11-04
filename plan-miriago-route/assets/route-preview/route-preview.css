@@ -248,6 +248,61 @@ input {
   background: #ea580c;
 }
 
+.group-status.planned::before {
+  background: #2563eb;
+}
+
+.group-status.special::before {
+  background: #a855f7;
+}
+
+.group-quality {
+  display: block;
+  margin-top: 3px;
+  color: #b45309;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.day-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 14px;
+  color: #35434b;
+  font-size: 12px;
+  font-weight: 650;
+  background: #eef2f3;
+  border-bottom: 1px solid #dce3e6;
+}
+
+.station-marker {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  place-items: center;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  background: #334155;
+  border: 2px solid #ffffff;
+  border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(17, 24, 39, 0.3);
+  cursor: pointer;
+}
+
+.legend-station {
+  width: 12px;
+  height: 12px;
+  background: #334155;
+  border-radius: 2px;
+}
+
+.legend-line.transit {
+  border-top: 2px dashed #7c3aed;
+}
+
 .locate-button {
   display: grid;
   width: 32px;

@@ -1,6 +1,7 @@
 # Public services and fair use
 
-These integrations require no API key. Overpass station lookup is optional.
+These integrations require no API key. Overpass station lookup, the offline
+walking network, and station-line lookup are optional.
 Valhalla route evaluation is conditional on the user's explicit route-policy
 choice and becomes required for the reviewed groups when that choice is `yes`.
 
@@ -24,6 +25,18 @@ Results come from OpenStreetMap under ODbL. Preserve attribution as
 `© OpenStreetMap contributors`. Station names, entrances, operators, and
 locations can be incomplete or stale.
 
+The `osm-network` module downloads walkable ways (footways, paths, steps,
+residential and service roads, platforms, and roads that allow pedestrians)
+plus rivers, canals, and water areas for each cluster of points. Bounding
+boxes are rounded outward to 0.01° so later runs reuse the 30-day cache, and
+`--walknet-file` / `--water-file` accept saved Overpass JSON for offline work.
+The `stations-assist` module looks up route relations (train, subway, light
+rail, tram, monorail) whose stop positions lie within 250 m of the candidate
+stations; line names are geography only and never imply a timetable.
+
+Overload responses (HTTP 429, 502, 503, 504) are retried after 3, 8, and 20
+seconds before being reported.
+
 Never:
 
 - issue one station query per point;
@@ -43,7 +56,10 @@ Default route-shape endpoint:
 
 The integration sends a pedestrian many-to-many matrix for one reviewed group,
 sets `X-Client-Id: plan-miriago-route`, converts Valhalla's default
-kilometre distances to metres, and caches the result for seven days.
+kilometre distances to metres, and caches each response for seven days.
+The public demo accepts at most 100 matrix cells and 10 route locations per
+request, so matrices are tiled into 10 × 10 blocks and route shapes into
+overlapping 10-location chunks, sent serially 0.25 s apart.
 It normally uses Python's HTTPS client; on older macOS system Python builds
 whose LibreSSL cannot negotiate with the demo server, it can fall back to the
 system `curl` transport. If neither transport works, local ordering remains.
@@ -64,8 +80,9 @@ and identifying header in its
 The public endpoint is a demo, not an SLA. Use it only after explicit approval
 and only for reviewed groups. A failure, rate limit, or disconnected point
 leaves the local order unchanged and must be persisted and shown as `failed`.
-Singletons and groups over the 25-point matrix limit must be persisted and shown
-as `skipped`. Never describe either status as a precise routed result.
+Singletons and groups above 58 bundled stops (60 matrix sites including ends)
+must be persisted and shown as `skipped`; use the offline OSM backend for them.
+Never describe either status as a precise routed result.
 
 ## OpenFreeMap preview basemap
 

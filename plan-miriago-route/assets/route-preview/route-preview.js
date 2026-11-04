@@ -37,6 +37,7 @@
     zoom: 2,
     attributionControl: false,
   });
+  window.__miriagoPreview = { map, data, groupMarkers };
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
   map.addControl(
     new maplibregl.AttributionControl({
@@ -55,10 +56,14 @@
     mapReady = true;
     map.addSource("preview-routes", { type: "geojson", data: filteredRoutes() });
     addRouteLayer("route-routed", "routed", ["get", "color"], 4, null);
+    addRouteLayer("route-planned", "planned", ["get", "color"], 3, null);
     addRouteLayer("route-approximate", "approximate", "#64748b", 2.5, [2, 2]);
     addRouteLayer("route-skipped", "skipped", "#94a3b8", 2.5, [1, 2]);
     addRouteLayer("route-failed", "failed", "#ea580c", 3, [1, 1.5]);
+    addTransitLayers();
     createMarkers();
+    createStationMarkers();
+    window.dispatchEvent(new CustomEvent("preview-markers-ready"));
     fitCoordinates(allVisibleCoordinates());
   });
 
@@ -109,9 +114,19 @@
 
   function renderGroupList() {
     const list = document.getElementById("group-list");
+    let currentDay = null;
     data.groups.forEach((group) => {
+      const dayLabel = group.day ? group.day.label : null;
+      if (dayLabel && dayLabel !== currentDay) {
+        const heading = document.createElement("div");
+        heading.className = "day-heading";
+        heading.textContent = [dayLabel, group.day.theme].filter(Boolean).join(" · ");
+        list.append(heading);
+      }
+      currentDay = dayLabel;
       const row = document.createElement("div");
       row.className = "group-row";
+      row.dataset.groupId = group.id;
 
       const label = document.createElement("label");
       label.className = "group-toggle";
@@ -146,6 +161,15 @@
       status.className = `group-status ${group.status}`;
       status.textContent = group.statusLabel;
       copy.append(name, metrics, status);
+      if (group.quality && (group.quality.crossings || group.quality.spurs)) {
+        const warning = document.createElement("span");
+        warning.className = "group-quality";
+        warning.textContent = [
+          group.quality.crossings ? `路线自相交 ${group.quality.crossings} 处` : null,
+          group.quality.spurs ? `单点折返 ${group.quality.spurs} 处` : null,
+        ].filter(Boolean).join(" · ");
+        copy.append(warning);
+      }
       label.append(checkbox, swatch, copy);
 
       const locate = document.createElement("button");
@@ -188,7 +212,7 @@
           .setLngLat([point.longitude, point.latitude])
           .setPopup(pointPopup(point))
           .addTo(map);
-        entries.push({ marker, element });
+        entries.push({ marker, element, point, groupId: group.id });
       });
       groupMarkers.set(group.id, entries);
     });
@@ -203,7 +227,7 @@
         .setLngLat([point.longitude, point.latitude])
         .setPopup(excludedPopup(point))
         .addTo(map);
-      excludedMarkers.push({ marker, element });
+      excludedMarkers.push({ marker, element, point });
     });
   }
 
@@ -215,6 +239,7 @@
     const detail = document.createElement("p");
     detail.textContent = `${point.groupName} · 第 ${point.order} 站`;
     root.append(title, detail);
+    if (window.__miriagoPopup) return window.__miriagoPopup(root, point);
     return new maplibregl.Popup({ offset: 18, closeButton: false }).setDOMContent(root);
   }
 
@@ -226,7 +251,63 @@
     const detail = document.createElement("p");
     detail.textContent = "已取舍";
     root.append(title, detail);
+    if (window.__miriagoPopup) return window.__miriagoPopup(root, point);
     return new maplibregl.Popup({ offset: 18, closeButton: false }).setDOMContent(root);
+  }
+
+  function addTransitLayers() {
+    const transitions = data.transitions || { type: "FeatureCollection", features: [] };
+    if (!transitions.features.length) return;
+    map.addSource("preview-transitions", { type: "geojson", data: transitions });
+    map.addLayer({
+      id: "transition-lines",
+      type: "line",
+      source: "preview-transitions",
+      layout: { "line-cap": "round" },
+      paint: {
+        "line-color": ["match", ["get", "mode"], "rail_candidate", "#7c3aed", "#a16207"],
+        "line-width": 2,
+        "line-dasharray": [3, 2],
+        "line-opacity": 0.85,
+      },
+    });
+    addLegend("transit", "换乘候选（仅地理信息）");
+  }
+
+  function createStationMarkers() {
+    const stations = data.stations || [];
+    stations.forEach((station) => {
+      const element = document.createElement("button");
+      element.type = "button";
+      element.className = "station-marker";
+      element.textContent = "駅";
+      element.setAttribute("aria-label", `车站：${station.name}`);
+      const root = document.createElement("div");
+      root.className = "preview-popup";
+      const title = document.createElement("h3");
+      title.textContent = station.name;
+      const detail = document.createElement("p");
+      detail.textContent = station.lines && station.lines.length
+        ? `线路：${station.lines.join("、")}`
+        : "车站（OpenStreetMap）";
+      root.append(title, detail);
+      new maplibregl.Marker({ element, anchor: "center" })
+        .setLngLat([station.longitude, station.latitude])
+        .setPopup(new maplibregl.Popup({ offset: 14, closeButton: false }).setDOMContent(root))
+        .addTo(map);
+    });
+    if (stations.length) addLegend("station", "进出站");
+  }
+
+  function addLegend(kind, text) {
+    const legend = document.querySelector(".legend");
+    if (!legend || legend.querySelector(`[data-legend="${kind}"]`)) return;
+    const item = document.createElement("span");
+    item.dataset.legend = kind;
+    const mark = document.createElement("i");
+    mark.className = kind === "station" ? "legend-station" : "legend-line transit";
+    item.append(mark, document.createTextNode(text));
+    legend.append(item);
   }
 
   function updateGroupVisibility() {

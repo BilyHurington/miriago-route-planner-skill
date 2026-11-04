@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from . import __version__
 from .clustering import (
@@ -33,8 +34,26 @@ from .journey_notes import (
 )
 from .package_io import LoadedPackage, PackageError, has_valid_coordinate
 
-PROPOSAL_SCHEMA_VERSION = 4
+PROPOSAL_SCHEMA_VERSION = 5
 PLACEHOLDER_PREFIXES = ("候选片区", "区域 ", "片区 ")
+GROUP_KINDS = frozenset({"route", "restricted", "unverified"})
+EXCLUSION_KINDS = frozenset({"time_tradeoff", "curation"})
+END_KINDS = frozenset({"station", "location", "point", "previous-group"})
+TRANSITION_MODES = frozenset({"walk", "rail_candidate", "transit_unknown", "day_break"})
+NETWORK_BACKENDS = frozenset({"valhalla", "osm"})
+MODULES = frozenset(
+    {
+        "osm-network",
+        "day-route",
+        "special-groups",
+        "stations-assist",
+        "dedupe",
+        "verify",
+        "classify",
+        "review-preview",
+        "review-server",
+    }
+)
 
 
 class ProposalError(ValueError):
@@ -47,14 +66,25 @@ def generate_proposal(
     *,
     stations: Sequence[dict[str, Any]] | None = None,
     station_source: Mapping[str, Any] | None = None,
+    special_groups: Sequence[Mapping[str, Any]] = (),
+    modules: Sequence[str] = (),
 ) -> dict[str, Any]:
     points = package.plan["points"]
+    special_ids = {
+        point_id
+        for special in special_groups
+        for point_id in special.get("pointIds", [])
+    }
     original_order = {
         point["id"]: index
         for index, point in enumerate(points)
         if isinstance(point.get("id"), str)
     }
-    valid_points = [point for point in points if has_valid_coordinate(point)]
+    valid_points = [
+        point
+        for point in points
+        if has_valid_coordinate(point) and point["id"] not in special_ids
+    ]
     invalid_ids = [point["id"] for point in points if not has_valid_coordinate(point)]
     raw_stops = [
         GeoPoint(
@@ -133,11 +163,25 @@ def generate_proposal(
                 },
                 "note": _default_note(metrics, station_candidates),
                 "warnings": [],
+                "kind": "route",
             }
+        )
+    point_by_id = {point["id"]: point for point in points}
+    for special in special_groups:
+        groups.append(
+            build_group(
+                package.plan["id"],
+                str(special["name"]),
+                list(special["pointIds"]),
+                point_by_id,
+                kind=str(special.get("kind") or "restricted"),
+                note=special.get("note"),
+            )
         )
 
     return {
         "schemaVersion": PROPOSAL_SCHEMA_VERSION,
+        "modules": sorted(set(modules)),
         "skill": {
             "name": "plan-miriago-route",
             "version": __version__,
@@ -148,16 +192,10 @@ def generate_proposal(
             "areasConfirmedAt": None,
             "routesConfirmed": False,
             "routesConfirmedAt": None,
+            "curationConfirmed": False,
+            "curationConfirmedAt": None,
         },
-        "routePolicy": {
-            "confirmed": False,
-            "confirmedAt": None,
-            "useRoadNetwork": None,
-            "adjustForTime": None,
-            "writePlanNotes": None,
-            "timeBudgetMinutes": None,
-            "tradeoffNotes": None,
-        },
+        "routePolicy": empty_route_policy(),
         "journeyNotes": {
             "status": "not_requested",
             "preparedAt": None,
@@ -183,6 +221,10 @@ def generate_proposal(
         "groups": groups,
         "excludedPoints": [],
         "unassignedPointIds": invalid_ids,
+        "constraints": {"via": []},
+        "transitions": [],
+        "stationAssist": empty_station_assist(),
+        "reviewHints": {},
         "dataSources": {
             "geometry": {
                 "provider": "local",
@@ -200,6 +242,64 @@ def generate_proposal(
     }
 
 
+def proposal_shell(
+    package: LoadedPackage,
+    *,
+    groups: list[dict[str, Any]],
+    profile: Mapping[str, Any],
+    data_sources: Mapping[str, Any],
+    modules: Sequence[str] = (),
+    constraints: Mapping[str, Any] | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
+    warnings: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Wrap planner-built groups in a draft proposal with closed gates."""
+    return {
+        "schemaVersion": PROPOSAL_SCHEMA_VERSION,
+        "modules": sorted(set(modules)),
+        "skill": {"name": "plan-miriago-route", "version": __version__},
+        "createdAt": _now(),
+        "review": {
+            "areasConfirmed": False,
+            "areasConfirmedAt": None,
+            "routesConfirmed": False,
+            "routesConfirmedAt": None,
+            "curationConfirmed": False,
+            "curationConfirmedAt": None,
+        },
+        "routePolicy": empty_route_policy(),
+        "journeyNotes": {
+            "status": "not_requested",
+            "preparedAt": None,
+            "confirmedAt": None,
+            "routeFingerprint": None,
+            "spec": None,
+            "markdown": None,
+        },
+        "input": {
+            "path": str(package.path),
+            "sha256": package.source_sha256,
+            "planId": package.plan["id"],
+            "planName": package.plan.get("name"),
+        },
+        "profile": dict(profile),
+        "groups": groups,
+        "excludedPoints": [],
+        "unassignedPointIds": [
+            point["id"]
+            for point in package.plan["points"]
+            if not has_valid_coordinate(point)
+        ],
+        "constraints": dict(constraints or {"via": []}),
+        "transitions": [],
+        "stationAssist": empty_station_assist(),
+        "reviewHints": {},
+        "dataSources": dict(data_sources),
+        "diagnostics": dict(diagnostics or {}),
+        "warnings": list(warnings) + list(package.warnings),
+    }
+
+
 def load_proposal(path: str | Path) -> dict[str, Any]:
     proposal_path = Path(path).expanduser().resolve()
     try:
@@ -211,7 +311,121 @@ def load_proposal(path: str | Path) -> dict[str, Any]:
         raise ProposalError(f"Cannot read proposal {proposal_path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ProposalError("Proposal must be a JSON object.")
-    return value
+    return upgrade_proposal(value)
+
+
+def upgrade_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    """Bring a schema-4 proposal to schema 5 without touching its decisions.
+
+    Version 5 only adds optional modules, so every confirmation recorded in a
+    version-4 proposal stays valid.
+    """
+    if proposal.get("schemaVersion") != 4:
+        return proposal
+    proposal["schemaVersion"] = PROPOSAL_SCHEMA_VERSION
+    proposal.setdefault("modules", [])
+    review = proposal.setdefault("review", {})
+    if isinstance(review, dict):
+        review.setdefault("curationConfirmed", False)
+        review.setdefault("curationConfirmedAt", None)
+    policy = proposal.get("routePolicy")
+    if isinstance(policy, dict):
+        policy.setdefault(
+            "networkBackend",
+            "valhalla" if policy.get("useRoadNetwork") is True else None,
+        )
+        policy.setdefault("stationsAssist", False if policy.get("confirmed") else None)
+    proposal.setdefault("constraints", {"via": []})
+    proposal.setdefault("transitions", [])
+    proposal.setdefault("stationAssist", empty_station_assist())
+    proposal.setdefault("reviewHints", {})
+    for group in proposal.get("groups", []):
+        if isinstance(group, dict):
+            group.setdefault("kind", "route")
+    # Exclusions without ``kind`` keep meaning time_tradeoff; leaving them
+    # untouched keeps confirmed journey-note fingerprints valid.
+    return proposal
+
+
+def empty_route_policy() -> dict[str, Any]:
+    return {
+        "confirmed": False,
+        "confirmedAt": None,
+        "useRoadNetwork": None,
+        "networkBackend": None,
+        "adjustForTime": None,
+        "writePlanNotes": None,
+        "stationsAssist": None,
+        "timeBudgetMinutes": None,
+        "tradeoffNotes": None,
+    }
+
+
+def empty_station_assist() -> dict[str, Any]:
+    return {"status": "not_requested", "plannedAt": None, "stations": []}
+
+
+def build_group(
+    plan_id: str,
+    name: str,
+    point_ids: Sequence[str],
+    point_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    kind: str = "route",
+    note: str | None = None,
+    anchor: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a proposal group from an ordered point list."""
+    if not point_ids:
+        raise ProposalError(f"Group {name!r} has no points.")
+    geo_points = [
+        GeoPoint(
+            key=point_id,
+            latitude=float(point_by_id[point_id]["latitude"]),
+            longitude=float(point_by_id[point_id]["longitude"]),
+            point_ids=(point_id,),
+        )
+        for point_id in point_ids
+    ]
+    matrix = distance_matrix(geo_points)
+    indices = list(range(len(geo_points)))
+    metrics = cluster_metrics(indices, geo_points, matrix)
+    direct = path_length(indices, matrix)
+    medoid = geo_points[medoid_index(indices, matrix)]
+    medoid_point = point_by_id[medoid.key]
+    return {
+        "id": _stable_group_id(plan_id, point_ids),
+        "name": name,
+        "kind": kind,
+        "pointIds": list(point_ids),
+        "pointNames": [
+            str(point_by_id[point_id].get("name") or point_id) for point_id in point_ids
+        ],
+        "anchor": dict(anchor)
+        if anchor
+        else {
+            "name": str(medoid_point.get("name") or medoid.key),
+            "latitude": float(medoid_point["latitude"]),
+            "longitude": float(medoid_point["longitude"]),
+            "pointId": medoid.key,
+            "kind": "point",
+        },
+        "medoid": {
+            "latitude": medoid.latitude,
+            "longitude": medoid.longitude,
+            "pointId": medoid.key,
+        },
+        "metrics": {
+            **metrics,
+            "directPathMeters": round(direct, 1),
+            "roughWalkingMeters": round(direct * 1.25, 1),
+            "walkingEstimateMethod": "haversine_path_x_1.25",
+        },
+        "nearbyStations": [],
+        "confidence": {"level": "reviewed", "reasons": []},
+        "note": note,
+        "warnings": [],
+    }
 
 
 def save_proposal(
@@ -255,6 +469,9 @@ def validate_proposal(
             errors.append("Proposal source hash does not match the input package.")
         if input_info.get("planId") != package.plan["id"]:
             errors.append("Proposal planId does not match the input package.")
+    modules = proposal.get("modules", [])
+    if not isinstance(modules, list) or any(item not in MODULES for item in modules):
+        errors.append(f"proposal.modules must be a list drawn from {sorted(MODULES)}.")
 
     points = package.plan["points"]
     valid_ids = {point["id"] for point in points if has_valid_coordinate(point)}
@@ -313,6 +530,17 @@ def validate_proposal(
         note = group.get("note")
         if note is not None and not isinstance(note, str):
             errors.append(f"{context}.note must be a string or null.")
+        kind = group.get("kind", "route")
+        if kind not in GROUP_KINDS:
+            errors.append(f"{context}.kind must be one of {sorted(GROUP_KINDS)}.")
+        _validate_day(group.get("day"), context, errors)
+        _validate_route_ends(
+            group.get("routeEnds"),
+            local_ids,
+            context,
+            errors,
+            first_group=index == 0,
+        )
         if anchor is None and reviewed_areas:
             errors.append(f"{context}.anchor is required for a final proposal.")
         elif anchor is not None:
@@ -356,6 +584,8 @@ def validate_proposal(
         excluded_at = exclusion.get("excludedAt")
         if not isinstance(excluded_at, str) or not excluded_at.strip():
             errors.append(f"{context}.excludedAt must be a non-empty string.")
+        if exclusion.get("kind", "time_tradeoff") not in EXCLUSION_KINDS:
+            errors.append(f"{context}.kind must be one of {sorted(EXCLUSION_KINDS)}.")
     duplicate_exclusions = sorted(
         point_id for point_id in set(excluded_ids) if excluded_ids.count(point_id) > 1
     )
@@ -409,10 +639,29 @@ def validate_proposal(
     tradeoff_notes = route_policy.get("tradeoffNotes")
     if tradeoff_notes is not None and not isinstance(tradeoff_notes, str):
         errors.append("routePolicy.tradeoffNotes must be a string or null.")
-    if excluded_set and adjust_for_time is not True:
+    time_excluded = [
+        item
+        for item in excluded
+        if isinstance(item, Mapping) and item.get("kind", "time_tradeoff") == "time_tradeoff"
+    ]
+    curation_excluded = [
+        item
+        for item in excluded
+        if isinstance(item, Mapping) and item.get("kind") == "curation"
+    ]
+    if time_excluded and adjust_for_time is not True:
         errors.append(
             "Excluded points require explicit approval of time-based route adjustments."
         )
+    network_backend = route_policy.get("networkBackend")
+    if network_backend is not None and network_backend not in NETWORK_BACKENDS:
+        errors.append(f"routePolicy.networkBackend must be one of {sorted(NETWORK_BACKENDS)}.")
+    if network_backend is not None and use_road_network is not True:
+        errors.append("routePolicy.networkBackend requires useRoadNetwork to be true.")
+    stations_assist = route_policy.get("stationsAssist")
+    if stations_assist is not None and not isinstance(stations_assist, bool):
+        errors.append("routePolicy.stationsAssist must be a boolean or null.")
+    _validate_transitions(proposal, group_ids, errors)
     if policy_confirmed:
         if not isinstance(use_road_network, bool):
             errors.append(
@@ -454,6 +703,30 @@ def validate_proposal(
                 "Route review gate is closed: set review.routesConfirmed only after "
                 "explicit user confirmation."
             )
+        if (
+            reviewed_areas
+            and curation_excluded
+            and review.get("curationConfirmed") is not True
+        ):
+            errors.append(
+                "Curation gate is closed: confirm the reviewed point removals with "
+                "confirm-curation before area approval."
+            )
+    station_state = proposal.get("stationAssist", empty_station_assist())
+    if not isinstance(station_state, Mapping) or station_state.get("status") not in {
+        "not_requested",
+        "planned",
+    }:
+        errors.append("stationAssist.status must be not_requested or planned.")
+    elif (
+        validation_stage == "final"
+        and stations_assist is True
+        and station_state.get("status") != "planned"
+    ):
+        errors.append(
+            "Station assistance was requested at the route policy gate; run "
+            "assist-stations before route confirmation."
+        )
     if validation_stage == "final" and use_road_network is True:
         _validate_route_evaluations(raw_groups, errors)
     if validation_stage == "draft":
@@ -470,7 +743,7 @@ def _validate_route_evaluations(
     errors: list[str],
 ) -> None:
     for index, group in enumerate(groups):
-        if not isinstance(group, Mapping):
+        if not isinstance(group, Mapping) or group.get("kind", "route") != "route":
             continue
         context = f"groups[{index}].routeEvaluation"
         evaluation = group.get("routeEvaluation")
@@ -490,6 +763,14 @@ def _validate_route_evaluations(
             errors.append(f"{context}.evaluatedAt must be a non-empty string.")
         if evaluation.get("pointIds") != group.get("pointIds"):
             errors.append(f"{context}.pointIds must match the current route order.")
+        if (
+            status == "routed"
+            and group.get("routeEnds")
+            and evaluation.get("routeEnds") != group.get("routeEnds")
+        ):
+            errors.append(
+                f"{context} is stale: the group's start or end changed after routing."
+            )
         if status == "routed":
             metrics = group.get("metrics")
             if not isinstance(metrics, Mapping):
@@ -510,6 +791,83 @@ def _validate_route_evaluations(
             reason = evaluation.get("reason")
             if not isinstance(reason, str) or not reason.strip():
                 errors.append(f"{context}.reason is required for {status} evaluation.")
+
+
+def _validate_day(value: Any, context: str, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        errors.append(f"{context}.day must be an object or null.")
+        return
+    label = value.get("label")
+    if not isinstance(label, str) or not label.strip():
+        errors.append(f"{context}.day.label must be a non-empty string.")
+    index = value.get("index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        errors.append(f"{context}.day.index must be a non-negative integer.")
+    theme = value.get("theme")
+    if theme is not None and not isinstance(theme, str):
+        errors.append(f"{context}.day.theme must be a string or null.")
+
+
+def _validate_route_ends(
+    value: Any,
+    point_ids: set[str],
+    context: str,
+    errors: list[str],
+    *,
+    first_group: bool,
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        errors.append(f"{context}.routeEnds must be an object or null.")
+        return
+    for side in ("start", "end"):
+        end = value.get(side)
+        if end is None:
+            continue
+        where = f"{context}.routeEnds.{side}"
+        if not isinstance(end, Mapping) or end.get("kind") not in END_KINDS:
+            errors.append(f"{where}.kind must be one of {sorted(END_KINDS)}.")
+            continue
+        kind = end["kind"]
+        if kind == "point" and end.get("pointId") not in point_ids:
+            errors.append(f"{where}.pointId must be a point of the group.")
+        if kind in {"station", "location"}:
+            for field in ("latitude", "longitude"):
+                number = end.get(field)
+                if (
+                    isinstance(number, bool)
+                    or not isinstance(number, (int, float))
+                    or not math.isfinite(float(number))
+                ):
+                    errors.append(f"{where}.{field} must be a number.")
+            if not isinstance(end.get("name"), str) or not end["name"].strip():
+                errors.append(f"{where}.name must be a non-empty string.")
+        if kind == "previous-group" and (side != "start" or first_group):
+            errors.append(f"{where}: previous-group is only valid as a later group's start.")
+
+
+def _validate_transitions(
+    proposal: Mapping[str, Any],
+    group_ids: set[str],
+    errors: list[str],
+) -> None:
+    transitions = proposal.get("transitions", [])
+    if not isinstance(transitions, list):
+        errors.append("proposal.transitions must be a list.")
+        return
+    for index, item in enumerate(transitions):
+        context = f"transitions[{index}]"
+        if not isinstance(item, Mapping):
+            errors.append(f"{context} must be an object.")
+            continue
+        for field in ("fromGroupId", "toGroupId"):
+            if item.get(field) not in group_ids:
+                errors.append(f"{context}.{field} must reference a current group.")
+        if item.get("mode") not in TRANSITION_MODES:
+            errors.append(f"{context}.mode must be one of {sorted(TRANSITION_MODES)}.")
 
 
 def _validate_journey_notes_state(
@@ -705,14 +1063,28 @@ def record_route_policy(
     write_plan_notes: bool = False,
     time_budget_minutes: float | None = None,
     tradeoff_notes: str | None = None,
+    network_backend: str | None = None,
+    stations_assist: bool = False,
 ) -> None:
+    if network_backend is not None and network_backend not in NETWORK_BACKENDS:
+        raise ProposalError(f"Unknown network backend: {network_backend}")
+    if network_backend is not None and not use_road_network:
+        raise ProposalError("--network-backend requires --road-network yes.")
+    if use_road_network and network_backend is None:
+        network_backend = "valhalla"
     if time_budget_minutes is not None and time_budget_minutes <= 0:
         raise ProposalError("--time-budget-minutes must be positive.")
     if time_budget_minutes is not None and not adjust_for_time:
         raise ProposalError(
             "--time-budget-minutes requires --time-adjustment yes."
         )
-    if proposal.get("excludedPoints") and not adjust_for_time:
+    if (
+        any(
+            isinstance(item, Mapping) and item.get("kind", "time_tradeoff") == "time_tradeoff"
+            for item in proposal.get("excludedPoints", [])
+        )
+        and not adjust_for_time
+    ):
         raise ProposalError(
             "Cannot decline time adjustments while the proposal has excluded points."
         )
@@ -720,11 +1092,15 @@ def record_route_policy(
         "confirmed": True,
         "confirmedAt": _now(),
         "useRoadNetwork": use_road_network,
+        "networkBackend": network_backend,
         "adjustForTime": adjust_for_time,
         "writePlanNotes": write_plan_notes,
+        "stationsAssist": stations_assist,
         "timeBudgetMinutes": time_budget_minutes,
         "tradeoffNotes": tradeoff_notes.strip() if tradeoff_notes else None,
     }
+    proposal["stationAssist"] = empty_station_assist()
+    proposal["transitions"] = []
     proposal["journeyNotes"] = {
         "status": "not_requested",
         "preparedAt": None,
@@ -737,6 +1113,8 @@ def record_route_policy(
         if not isinstance(group, dict):
             continue
         group.pop("routeEvaluation", None)
+        group.pop("access", None)
+        group.pop("quality", None)
         _clear_routed_metrics(group)
     proposal.setdefault("dataSources", {})["walking"] = {
         "provider": "local",
@@ -758,6 +1136,80 @@ def exclude_points_for_time(
         raise ProposalError(
             "Point exclusions require --time-adjustment yes at the route policy gate."
         )
+    _exclude_points(package, proposal, exclusions, kind="time_tradeoff")
+    if route_policy.get("useRoadNetwork") is True:
+        walking_source = proposal.get("dataSources", {}).get("walking", {})
+        provider = (
+            walking_source.get("provider")
+            if isinstance(walking_source, Mapping)
+            else None
+        )
+        update_walking_source_summary(
+            proposal,
+            provider=provider or "fossgis_valhalla_pedestrian_matrix",
+        )
+
+
+def exclude_points_for_curation(
+    package: LoadedPackage,
+    proposal: dict[str, Any],
+    exclusions: Sequence[tuple[str, str]],
+) -> None:
+    """Record reviewed duplicate/unwanted points; the curation gate reopens."""
+    if exclusions:
+        _exclude_points(package, proposal, exclusions, kind="curation")
+    review = proposal.setdefault("review", {})
+    review["curationConfirmed"] = False
+    review["curationConfirmedAt"] = None
+
+
+def restore_curated_points(
+    package: LoadedPackage,
+    proposal: dict[str, Any],
+    point_ids: Sequence[str],
+) -> list[str]:
+    """Undo curation exclusions, reinserting points at their former position."""
+    wanted = set(point_ids)
+    point_by_id = {point["id"]: point for point in package.plan["points"]}
+    groups = {
+        group["id"]: group
+        for group in proposal.get("groups", [])
+        if isinstance(group, dict)
+    }
+    restored: list[str] = []
+    remaining: list[Any] = []
+    for item in proposal.get("excludedPoints", []):
+        if (
+            not isinstance(item, Mapping)
+            or item.get("kind") != "curation"
+            or item.get("pointId") not in wanted
+        ):
+            remaining.append(item)
+            continue
+        group = groups.get(item.get("previousGroupId"))
+        if group is None:
+            remaining.append(item)
+            continue
+        position = min(int(item.get("previousOrderIndex") or 0), len(group["pointIds"]))
+        group["pointIds"].insert(position, item["pointId"])
+        _refresh_group_after_membership_change(group, point_by_id)
+        restored.append(item["pointId"])
+    if restored:
+        proposal["excludedPoints"] = remaining
+        review = proposal.setdefault("review", {})
+        review["curationConfirmed"] = False
+        review["curationConfirmedAt"] = None
+        _reset_route_confirmation(proposal)
+    return restored
+
+
+def _exclude_points(
+    package: LoadedPackage,
+    proposal: dict[str, Any],
+    exclusions: Sequence[tuple[str, str]],
+    *,
+    kind: str,
+) -> None:
     if not exclusions:
         raise ProposalError("At least one point exclusion is required.")
 
@@ -813,6 +1265,7 @@ def exclude_points_for_time(
                 "pointId": point_id,
                 "pointName": str(point_by_id[point_id].get("name") or point_id),
                 "reason": reason.strip(),
+                "kind": kind,
                 "previousGroupId": group_id,
                 "previousOrderIndex": order_index,
                 "excludedAt": excluded_at,
@@ -835,18 +1288,24 @@ def exclude_points_for_time(
         _refresh_group_after_membership_change(group, point_by_id)
         retained_groups.append(group)
     proposal["groups"] = retained_groups
+    retained_ids = {group["id"] for group in retained_groups}
+    proposal["transitions"] = [
+        item
+        for item in proposal.get("transitions", [])
+        if isinstance(item, Mapping)
+        and item.get("fromGroupId") in retained_ids
+        and item.get("toGroupId") in retained_ids
+    ]
+    for position, group in enumerate(retained_groups):
+        ends = group.get("routeEnds")
+        if (
+            position == 0
+            and isinstance(ends, dict)
+            and isinstance(ends.get("start"), Mapping)
+            and ends["start"].get("kind") == "previous-group"
+        ):
+            ends["start"] = None
     _reset_route_confirmation(proposal)
-    if route_policy.get("useRoadNetwork") is True:
-        walking_source = proposal.get("dataSources", {}).get("walking", {})
-        provider = (
-            walking_source.get("provider")
-            if isinstance(walking_source, Mapping)
-            else None
-        )
-        update_walking_source_summary(
-            proposal,
-            provider=provider or "fossgis_valhalla_pedestrian_matrix",
-        )
 
 
 def update_group_with_walking_matrix(
@@ -857,6 +1316,9 @@ def update_group_with_walking_matrix(
     distance_meters: float,
     duration_seconds: float,
     provider: str,
+    extra_metrics: Mapping[str, Any] | None = None,
+    access: Mapping[str, Any] | None = None,
+    quality: Mapping[str, Any] | None = None,
 ) -> None:
     group = next(
         (item for item in proposal.get("groups", []) if item.get("id") == group_id),
@@ -882,12 +1344,22 @@ def update_group_with_walking_matrix(
     metrics["walkingPathMeters"] = round(distance_meters, 1)
     metrics["walkingDurationSeconds"] = round(duration_seconds, 1)
     metrics["walkingEstimateMethod"] = provider
-    group["routeEvaluation"] = {
+    metrics.update(dict(extra_metrics or {}))
+    evaluation: dict[str, Any] = {
         "status": "routed",
         "provider": provider,
         "pointIds": list(ordered_point_ids),
         "evaluatedAt": _now(),
     }
+    if group.get("routeEnds"):
+        evaluation["routeEnds"] = deepcopy(group["routeEnds"])
+    group["routeEvaluation"] = evaluation
+    if access:
+        group["access"] = dict(access)
+    else:
+        group.pop("access", None)
+    if quality is not None:
+        group["quality"] = dict(quality)
     _reset_route_confirmation(proposal)
 
 
@@ -957,6 +1429,8 @@ def _refresh_group_after_membership_change(
     metrics["directPathMeters"] = round(direct_path, 1)
     metrics["roughWalkingMeters"] = round(direct_path * 1.25, 1)
     _clear_routed_metrics(group)
+    group.pop("access", None)
+    group.pop("quality", None)
     group["pointNames"] = [
         str(point_by_id[point_id].get("name") or point_id) for point_id in point_ids
     ]
@@ -992,6 +1466,8 @@ def _clear_routed_metrics(group: dict[str, Any]) -> None:
         return
     metrics.pop("walkingPathMeters", None)
     metrics.pop("walkingDurationSeconds", None)
+    metrics.pop("accessMeters", None)
+    metrics.pop("routedStopCount", None)
     metrics["walkingEstimateMethod"] = "haversine_path_x_1.25"
 
 
@@ -1073,7 +1549,7 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def proposal_summary(proposal: Mapping[str, Any]) -> dict[str, Any]:
@@ -1116,7 +1592,37 @@ def proposal_summary(proposal: Mapping[str, Any]) -> dict[str, Any]:
         "journeyNotesStatus": proposal.get("journeyNotes", {}).get("status")
         if isinstance(proposal.get("journeyNotes"), Mapping)
         else None,
+        "modules": proposal.get("modules", []),
+        "groupKinds": _count_by(
+            group.get("kind", "route") for group in groups if isinstance(group, Mapping)
+        )
+        if isinstance(groups, list)
+        else {},
+        "exclusionKinds": _count_by(
+            item.get("kind", "time_tradeoff")
+            for item in proposal.get("excludedPoints", [])
+            if isinstance(item, Mapping)
+        ),
+        "curationConfirmed": review.get("curationConfirmed") is True
+        if isinstance(review, Mapping)
+        else False,
+        "networkBackend": route_policy.get("networkBackend")
+        if isinstance(route_policy, Mapping)
+        else None,
+        "stationsAssist": route_policy.get("stationsAssist")
+        if isinstance(route_policy, Mapping)
+        else None,
+        "stationAssistStatus": proposal.get("stationAssist", {}).get("status")
+        if isinstance(proposal.get("stationAssist"), Mapping)
+        else None,
     }
+
+
+def _count_by(values: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[str(value)] = counts.get(str(value), 0) + 1
+    return counts
 
 
 def ensure_source_not_output(

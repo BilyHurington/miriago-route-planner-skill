@@ -12,9 +12,12 @@ Maps、KML/KMZ 或已有 `.sjhplan` 数据包收集点位，经过逐步确认�
 - 根据作品名搜索 Bangumi，并从 Anitabi 导入用户选定的作品。
 - 下载并整合公开 Google My Maps 数据或本地 KML/KMZ 文件。
 - 在不覆盖源文件的前提下扩展已有 MiriaGo v2 数据包。
-- 将点位划分为可复核的地理片区，并规划各片区内的巡礼顺序。
+- 将点位划分为可复核的地理片区，或按天规划首尾相接的路线片区（可选），并规划各片区内的巡礼顺序。
 - 生成单文件交互式 HTML 预览，显示每个片区的路线、编号点位、取舍点和无效坐标。
-- 可选用公共 Valhalla 路网精确评估步行路线。
+- 可选用公共 Valhalla 或离线 OpenStreetMap 步行路网精确评估路线；检查路线自相交、单点折返和重复步行。
+- 可选根据车站规划每天与各片区的进出站，并标出片区间的乘车候选（只用地理信息，不编造时刻与票价）。
+- 可选的点位整理：同机位去重、卫星图与街景坐标核对、AI 保留/可选/丢弃分类，均可交给子 Agent 分批完成。
+- 可选的交互审核页：参考图、外部链接、快速分类面板，配合本地后端把判定写入临时数据库，确认后才生效。
 - 记录点位取舍和路线时长调整，同时保留原始点位，方便撤销和追溯。
 - 将片区间交通、预计步行时间和注意事项写入 MiriaGo 计划备注。
 - 强制保存所有参考图片的缩略图，以及策略要求的完整图片。
@@ -24,16 +27,44 @@ Maps、KML/KMZ 或已有 `.sjhplan` 数据包收集点位，经过逐步确认�
 
 工作流会在以下阶段停止并等待用户明确确认：
 
-1. 收集必要输入
+1. 收集必要输入，并一次性选择可选模块（快速 / 标准 / 完整审核）
 2. 选择 Bangumi 搜索结果
-3. 复核来源导入结果
-4. 复核片区划分
-5. 选择路线规划策略
-6. 复核行程备注（如需要）
-7. 复核最终路线
-8. 选择是否包含 Anitabi 完整参考图片
+3. 复核来源导入结果（含去重与坐标核对的修改）
+4. 复核人工剔除的点位（仅在交互审核中删除过点位时）
+5. 复核片区划分
+6. 选择路线规划策略（路网、取舍、行程备注、车站辅助）
+7. 复核行程备注（如需要）
+8. 复核最终路线
+9. 选择是否包含 Anitabi 完整参考图片
 
 CLI 会记录并校验确认状态，Agent 不能通过直接修改确认字段绕过这些节点。
+
+## 可选模块
+
+2.0 起，工作流分为「核心流程」和「可选模块」。不开任何模块时与 1.7 的体验一致；
+需要的模块在输入确认节点一次性选好，没选的模块不会运行，也不会再询问。
+
+| 组合 | 包含的模块 |
+|---|---|
+| 快速 | 只用核心流程 |
+| 标准（多日行程推荐） | 离线路网 `osm-network`、车站辅助 `stations-assist`、审核预览 `review-preview` |
+| 完整审核 | 标准 + 去重 `dedupe`、坐标核对 `verify`、AI 分类 `classify`、审核后端 `review-server`、按天规划 `day-route`、特殊片区 `special-groups` |
+
+| 模块 | 作用 |
+|---|---|
+| `osm-network` | 下载并缓存 OpenStreetMap 步行路网（也可读取本地 Overpass JSON），离线计算步行距离；近距离修正不会跨河 |
+| `day-route` | 每个点位池走一条最短路线，按车站位置切分为多天，再按目标时长切成首尾相接的片区；支持途经点（例如指定登山道）和固定起终点 |
+| `special-groups` | 「限定开放」「位置待考证」点位单独成组，保留在数据包中但不参与路线规划 |
+| `stations-assist` | 为每天和每个片区选择进出站，标出片区间可步行、可乘车或待确认的衔接，并生成行程备注草稿（时刻与票价留空） |
+| `dedupe` / `verify` / `classify` | 同机位去重、卫星图与街景坐标核对、保留/可选/丢弃分类；生成分批任务交给子 Agent，结果按固定格式写回 |
+| `review-preview` / `review-server` | 交互审核页（参考图、外部链接、快速分类面板）与本地后端；判定写入临时 SQLite，确认后才转为可撤销的「人工剔除」 |
+
+无论是否启用模块，以下改进都始终生效：机位聚合改为全连接，避免把一整条街串成一个机位；
+Valhalla 请求按公共服务器上限自动分块；片区内路线改用精确求解（9 个机位以内）或多起点
+2-opt / Or-opt 求解，并检查路线自相交与单点折返。
+
+详细说明见 `plan-miriago-route/references/optional-modules.md`，按天规划的配置格式见
+`plan-miriago-route/references/day-route-config.md`。
 
 ## 推荐：直接交给 ChatGPT Work
 
@@ -121,7 +152,35 @@ python3 plan-miriago-route/scripts/miriago_plan.py render-preview \
 
 `auto` 只会在用户已明确同意步行路网评估，且当前片区已成功评估时
 请求 Valhalla 真实线形；其他情况会明确显示直线降级。加上 `--no-basemap`
-可在打开 HTML 时不请求在线底图。预览生成进度会以 JSONL 输出到 stderr。
+可在打开 HTML 时不请求在线底图。使用离线路网时，用 `--geometry-file` 传入
+`plan-days` 或 `refine` 输出的路网线形。预览生成进度会以 JSONL 输出到 stderr。
+
+启用模块后的常用命令示例：
+
+```bash
+# 按天规划片区（离线路网，路网线形另存，供预览使用）
+python3 plan-miriago-route/scripts/miriago_plan.py plan-days \
+  combined.sjhplan --config day-config.json \
+  --output areas-draft.json --geometry-output areas-geometry.json
+
+# 生成交互审核页，并启动本地后端（判定写入临时数据库）
+python3 plan-miriago-route/scripts/miriago_plan.py render-preview \
+  combined.sjhplan areas-draft.json --mode review \
+  --geometry-file areas-geometry.json --output review/areas.html
+python3 plan-miriago-route/scripts/miriago_plan.py serve-review \
+  review/areas.html --db review.sqlite --package combined.sjhplan
+
+# 审核结束后转成草稿，经确认后生效
+python3 plan-miriago-route/scripts/miriago_plan.py apply-review \
+  combined.sjhplan areas-draft.json --db review.sqlite --output areas-curated.json
+
+# 路线策略确认后：车站辅助与离线路网评估
+python3 plan-miriago-route/scripts/miriago_plan.py assist-stations \
+  combined.sjhplan route-policy-confirmed.json --output stations.json
+python3 plan-miriago-route/scripts/miriago_plan.py refine \
+  combined.sjhplan stations.json --all-groups \
+  --geometry-output routes-geometry.json --output routes-draft.json
+```
 
 参考图片默认使用 8 个线程下载。生成数据包的命令支持
 `--image-download-workers 1-32`；需要严格复现请求顺序时可设为 1。下载进度会
@@ -130,9 +189,9 @@ python3 plan-miriago-route/scripts/miriago_plan.py render-preview \
 ## 环境要求
 
 - Python 3.10 或更高版本
-- 生成非 Anitabi 图片缩略图时需要 Pillow
+- 生成非 Anitabi 图片缩略图、去重与核对用的对照图时需要 Pillow
 - 使用 Bangumi、Anitabi、Google My Maps、Overpass、Valhalla 或在线底图时需要
-  公共网络访问
+  公共网络访问；离线路网与车站数据可改用本地保存的 Overpass JSON
 
 安装图片处理依赖：
 
@@ -153,7 +212,9 @@ ruff check scripts tests
 PYTHONPATH=scripts python3 -m unittest discover -s tests -t . -v
 ```
 
-当前 Skill 与插件版本为 `1.7.0`。
+当前 Skill 与插件版本为 `2.0.0`。2.0 的流程设计见
+[docs/skill-2.0-设计.md](docs/skill-2.0-设计.md)，各可选模块说明见
+`plan-miriago-route/references/optional-modules.md`。
 
 ## 开源协议
 

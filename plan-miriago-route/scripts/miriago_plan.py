@@ -7,9 +7,8 @@ import argparse
 import hashlib
 import json
 import sys
-import time
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,19 @@ from miriago_planner.bangumi_anitabi import (
     search_bangumi,
 )
 from miriago_planner.clustering import profile_with_overrides
+from miriago_planner.curation import (
+    CurationError,
+    ThumbnailSource,
+    apply_dedupe,
+    apply_verify,
+    draft_points,
+    merge_classify,
+    unverified_special_group,
+    write_classify_batches,
+    write_dedupe_batch,
+    write_verify_batches,
+)
+from miriago_planner.day_planner import load_config, plan_days, select_points
 from miriago_planner.google_my_maps import collect_google_my_maps_source
 from miriago_planner.journey_notes import (
     JourneyNotesError,
@@ -34,23 +46,26 @@ from miriago_planner.package_io import (
     DERIVED_ENTRIES,
     PackageError,
     create_package,
+    has_valid_coordinate,
     load_package,
     package_summary,
     rebuild_package,
 )
 from miriago_planner.proposal import (
+    MODULES,
     ProposalError,
     apply_proposal,
+    empty_route_policy,
+    empty_station_assist,
     ensure_source_not_output,
+    exclude_points_for_curation,
     exclude_points_for_time,
     generate_proposal,
     load_proposal,
     proposal_summary,
-    record_group_route_evaluation,
     record_route_policy,
+    restore_curated_points,
     save_proposal,
-    update_group_with_walking_matrix,
-    update_walking_source_summary,
     validate_proposal,
 )
 from miriago_planner.public_services import (
@@ -60,8 +75,6 @@ from miriago_planner.public_services import (
     JsonCache,
     PublicServiceError,
     fetch_stations,
-    fetch_walking_matrix,
-    optimize_walking_order,
     station_boxes_from_proposal,
 )
 from miriago_planner.reference_images import (
@@ -70,11 +83,14 @@ from miriago_planner.reference_images import (
     ReferenceImageError,
     bundle_reference_images,
 )
+from miriago_planner.review_server import ReviewStoreError, load_decisions, serve_review
 from miriago_planner.route_preview import (
     GEOMETRY_MODES,
+    PREVIEW_MODES,
     RoutePreviewError,
     render_route_preview,
 )
+from miriago_planner.route_refine import refine_groups
 from miriago_planner.source_import import (
     ImportProposalError,
     apply_import_proposal,
@@ -84,6 +100,14 @@ from miriago_planner.source_import import (
     save_import_proposal,
     validate_import_proposal,
 )
+from miriago_planner.stations import (
+    assist_stations,
+    draft_notes_spec,
+    fetch_station_lines,
+    station_candidates,
+    stations_from_files,
+)
+from miriago_planner.walking import BACKENDS, make_backend
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,6 +208,16 @@ def build_parser() -> argparse.ArgumentParser:
     propose_parser.add_argument("--max-radius-meters", type=float)
     propose_parser.add_argument("--hard-link-meters", type=float)
     propose_parser.add_argument(
+        "--bundle-meters",
+        type=float,
+        help="Merge scenes within this distance into one stop (complete linkage).",
+    )
+    propose_parser.add_argument(
+        "--special-groups",
+        help="JSON list of restricted/unverified groups kept out of route planning.",
+    )
+    _add_modules(propose_parser)
+    propose_parser.add_argument(
         "--fetch-stations",
         action="store_true",
         help="Bulk-fetch nearby public transport candidates through Overpass.",
@@ -195,6 +229,23 @@ def build_parser() -> argparse.ArgumentParser:
     propose_parser.add_argument("--cache-dir")
     propose_parser.add_argument("--force", action="store_true")
     propose_parser.set_defaults(handler=_propose)
+
+    plan_days_parser = subparsers.add_parser(
+        "plan-days",
+        help="Optional module: plan day-based route areas from a pool config.",
+    )
+    plan_days_parser.add_argument("input")
+    plan_days_parser.add_argument("--config", required=True)
+    plan_days_parser.add_argument("--output", required=True)
+    plan_days_parser.add_argument(
+        "--base-proposal",
+        help="Earlier proposal whose group names selectors may use and whose curation is kept.",
+    )
+    plan_days_parser.add_argument("--geometry-output")
+    _add_network_arguments(plan_days_parser)
+    _add_modules(plan_days_parser)
+    plan_days_parser.add_argument("--force", action="store_true")
+    plan_days_parser.set_defaults(handler=_plan_days)
 
     proposal_parser = subparsers.add_parser(
         "validate-proposal",
@@ -252,6 +303,17 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Write reviewed travel segments, walking estimates, and cautions to memo.",
     )
+    route_policy_parser.add_argument(
+        "--network-backend",
+        choices=tuple(sorted({"valhalla", "osm"})),
+        help="Road-network source when --road-network yes (default: valhalla).",
+    )
+    route_policy_parser.add_argument(
+        "--stations-assist",
+        choices=("yes", "no"),
+        default="no",
+        help="Plan station entries/exits and area transitions (stations-assist module).",
+    )
     route_policy_parser.add_argument("--time-budget-minutes", type=float)
     route_policy_parser.add_argument("--tradeoff-notes")
     route_policy_parser.add_argument("--output", required=True)
@@ -299,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refine_parser = subparsers.add_parser(
         "refine",
-        help="Optionally refine small group orders with public Valhalla walking data.",
+        help="Order every area on the approved walking network (Valhalla or offline OSM).",
     )
     refine_parser.add_argument("input")
     refine_parser.add_argument("proposal")
@@ -307,14 +369,22 @@ def build_parser() -> argparse.ArgumentParser:
     refine_parser.add_argument(
         "--group-id",
         action="append",
-        required=True,
+        default=[],
         help="Group to refine; repeat to select more than one group.",
     )
     refine_parser.add_argument(
-        "--valhalla-endpoint",
-        default=DEFAULT_VALHALLA_ENDPOINT,
+        "--all-groups",
+        action="store_true",
+        help="Refine every current group, in plan order.",
     )
-    refine_parser.add_argument("--cache-dir")
+    refine_parser.add_argument(
+        "--backend",
+        choices=("valhalla", "osm"),
+        help="Defaults to the backend approved at the route policy gate.",
+    )
+    refine_parser.add_argument("--restarts", type=int, default=48)
+    refine_parser.add_argument("--geometry-output")
+    _add_network_arguments(refine_parser, backend=False)
     refine_parser.add_argument("--force", action="store_true")
     refine_parser.set_defaults(handler=_refine)
 
@@ -335,6 +405,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     preview_parser.add_argument(
+        "--mode",
+        choices=tuple(sorted(PREVIEW_MODES)),
+        default="compact",
+        help="review adds images, links, decisions, and quick classification.",
+    )
+    preview_parser.add_argument(
+        "--geometry-file",
+        help="Route shapes written by plan-days or refine --geometry-output.",
+    )
+    preview_parser.add_argument(
         "--no-basemap",
         action="store_true",
         help="Render routes and points without loading an online basemap.",
@@ -346,6 +426,139 @@ def build_parser() -> argparse.ArgumentParser:
     preview_parser.add_argument("--cache-dir")
     preview_parser.add_argument("--force", action="store_true")
     preview_parser.set_defaults(handler=_render_preview)
+
+    stations_parser = subparsers.add_parser(
+        "assist-stations",
+        help="Optional module: choose station entries/exits and classify transitions.",
+    )
+    stations_parser.add_argument("input")
+    stations_parser.add_argument("proposal")
+    stations_parser.add_argument("--output", required=True)
+    stations_parser.add_argument("--walk-threshold-meters", type=float, default=1_200)
+    stations_parser.add_argument("--max-access-meters", type=float, default=1_500)
+    stations_parser.add_argument(
+        "--station-file",
+        action="append",
+        default=[],
+        help="Local Overpass JSON with stations (repeatable); skips the station download.",
+    )
+    stations_parser.add_argument("--overpass-endpoint", default=DEFAULT_OVERPASS_ENDPOINT)
+    stations_parser.add_argument("--cache-dir")
+    stations_parser.add_argument("--force", action="store_true")
+    stations_parser.set_defaults(handler=_assist_stations)
+
+    notes_spec_parser = subparsers.add_parser(
+        "draft-notes-spec",
+        help="Write a journey-notes JSON skeleton from station transitions.",
+    )
+    notes_spec_parser.add_argument("input")
+    notes_spec_parser.add_argument("proposal")
+    notes_spec_parser.add_argument("--checked-at", required=True)
+    notes_spec_parser.add_argument("--timezone", required=True)
+    notes_spec_parser.add_argument("--title", default="巡礼行程建议")
+    notes_spec_parser.add_argument("--output", required=True)
+    notes_spec_parser.add_argument("--force", action="store_true")
+    notes_spec_parser.set_defaults(handler=_draft_notes_spec)
+
+    serve_parser = subparsers.add_parser(
+        "serve-review",
+        help="Optional module: serve a review preview with a temporary decision store.",
+    )
+    serve_parser.add_argument("preview")
+    serve_parser.add_argument("--db", required=True)
+    serve_parser.add_argument("--package", help="Serve full reference images from this package.")
+    serve_parser.add_argument("--port", type=int, default=8791)
+    serve_parser.set_defaults(handler=_serve_review)
+
+    apply_review_parser = subparsers.add_parser(
+        "apply-review",
+        help="Turn stored keep/delete decisions into a curation draft proposal.",
+    )
+    apply_review_parser.add_argument("input")
+    apply_review_parser.add_argument("proposal")
+    source = apply_review_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--db")
+    source.add_argument("--decisions")
+    apply_review_parser.add_argument("--reason", default="人工审核删除（重复或不需要的画面）")
+    apply_review_parser.add_argument("--output", required=True)
+    apply_review_parser.add_argument("--force", action="store_true")
+    apply_review_parser.set_defaults(handler=_apply_review)
+
+    confirm_curation_parser = subparsers.add_parser(
+        "confirm-curation",
+        help="Record explicit approval of reviewed point removals.",
+    )
+    confirm_curation_parser.add_argument("input")
+    confirm_curation_parser.add_argument("proposal")
+    confirm_curation_parser.add_argument("--output", required=True)
+    confirm_curation_parser.add_argument("--force", action="store_true")
+    confirm_curation_parser.set_defaults(handler=_confirm_curation)
+
+    dedupe_parser = subparsers.add_parser(
+        "dedupe-candidates",
+        help="Optional module: same-shot candidate groups and a picker page for an import draft.",
+    )
+    dedupe_parser.add_argument("draft")
+    dedupe_parser.add_argument("--output-dir", required=True)
+    dedupe_parser.add_argument("--meters", type=float, default=30)
+    _add_thumbnail_arguments(dedupe_parser)
+    dedupe_parser.set_defaults(handler=_dedupe_candidates)
+
+    apply_dedupe_parser = subparsers.add_parser(
+        "apply-dedupe", help="Apply dedupe decisions to a new import draft."
+    )
+    apply_dedupe_parser.add_argument("draft")
+    apply_dedupe_parser.add_argument("--candidates", required=True)
+    apply_dedupe_parser.add_argument("--decisions", required=True)
+    apply_dedupe_parser.add_argument("--output", required=True)
+    apply_dedupe_parser.add_argument("--force", action="store_true")
+    apply_dedupe_parser.set_defaults(handler=_apply_dedupe)
+
+    verify_parser = subparsers.add_parser(
+        "verify-batches",
+        help="Optional module: satellite/street-view check batches for an import draft.",
+    )
+    verify_parser.add_argument("draft")
+    verify_parser.add_argument("--output-dir", required=True)
+    verify_parser.add_argument("--meters", type=float, default=15)
+    verify_parser.add_argument("--batch-points", type=int, default=120)
+    _add_thumbnail_arguments(verify_parser)
+    verify_parser.set_defaults(handler=_verify_batches)
+
+    apply_verify_parser = subparsers.add_parser(
+        "apply-verify", help="Apply verify.json results to a new import draft."
+    )
+    apply_verify_parser.add_argument("draft")
+    apply_verify_parser.add_argument("--batches-dir", required=True)
+    apply_verify_parser.add_argument("--output", required=True)
+    apply_verify_parser.add_argument(
+        "--special-groups-output",
+        help="Write an unverified special-group file for propose/plan-days.",
+    )
+    apply_verify_parser.add_argument("--force", action="store_true")
+    apply_verify_parser.set_defaults(handler=_apply_verify)
+
+    classify_parser = subparsers.add_parser(
+        "classify-batches",
+        help="Optional module: keep/optional/drop classification batches by area.",
+    )
+    classify_parser.add_argument("input")
+    classify_parser.add_argument("proposal")
+    classify_parser.add_argument("--output-dir", required=True)
+    classify_parser.add_argument("--meters", type=float, default=30)
+    classify_parser.add_argument("--batch-points", type=int, default=250)
+    _add_thumbnail_arguments(classify_parser)
+    classify_parser.set_defaults(handler=_classify_batches)
+
+    merge_classify_parser = subparsers.add_parser(
+        "merge-classify", help="Merge classify.json results into proposal.reviewHints."
+    )
+    merge_classify_parser.add_argument("input")
+    merge_classify_parser.add_argument("proposal")
+    merge_classify_parser.add_argument("--batches-dir", required=True)
+    merge_classify_parser.add_argument("--output", required=True)
+    merge_classify_parser.add_argument("--force", action="store_true")
+    merge_classify_parser.set_defaults(handler=_merge_classify)
 
     apply_parser = subparsers.add_parser(
         "apply", help="Apply a completed proposal to a new .sjhplan package."
@@ -367,6 +580,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.set_defaults(handler=_validate_package)
     return parser
+
+
+def _add_modules(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--modules",
+        default="",
+        help=f"Comma-separated optional modules chosen at the input gate: {', '.join(sorted(MODULES))}.",
+    )
+
+
+def _parse_modules(value: str) -> list[str]:
+    modules = sorted({item.strip() for item in value.split(",") if item.strip()})
+    unknown = sorted(set(modules) - MODULES)
+    if unknown:
+        raise ValueError(f"Unknown modules: {unknown}; choose from {sorted(MODULES)}.")
+    return modules
+
+
+def _add_network_arguments(parser: argparse.ArgumentParser, *, backend: bool = True) -> None:
+    if backend:
+        parser.add_argument(
+            "--backend",
+            choices=BACKENDS,
+            help="Override the config's network backend.",
+        )
+    parser.add_argument(
+        "--walknet-file",
+        action="append",
+        default=[],
+        help="Local Overpass JSON walking network (repeatable); skips the download.",
+    )
+    parser.add_argument("--water-file", action="append", default=[])
+    parser.add_argument("--overpass-endpoint", default=DEFAULT_OVERPASS_ENDPOINT)
+    parser.add_argument("--valhalla-endpoint", default=DEFAULT_VALHALLA_ENDPOINT)
+    parser.add_argument("--valhalla-route-endpoint", default=DEFAULT_VALHALLA_ROUTE_ENDPOINT)
+    parser.add_argument("--cache-dir")
+
+
+def _add_thumbnail_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--package", help="Take thumbnails from this package's assets.")
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Never download thumbnails; use package assets or skip images.",
+    )
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--force", action="store_true")
 
 
 def _add_reference_image_policy(parser: argparse.ArgumentParser) -> None:
@@ -542,8 +802,13 @@ def _propose(args: argparse.Namespace) -> dict[str, Any]:
         max_points=args.max_points,
         max_radius_meters=args.max_radius_meters,
         hard_link_meters=args.hard_link_meters,
+        bundle_distance_meters=args.bundle_meters,
     )
-    proposal = generate_proposal(package, profile)
+    modules = _parse_modules(args.modules)
+    specials = _special_groups(package, args.special_groups)
+    if specials:
+        modules = sorted({*modules, "special-groups"})
+    proposal = generate_proposal(package, profile, special_groups=specials, modules=modules)
     if args.fetch_stations:
         result = fetch_stations(
             station_boxes_from_proposal(proposal),
@@ -555,6 +820,8 @@ def _propose(args: argparse.Namespace) -> dict[str, Any]:
             profile,
             stations=result.stations,
             station_source=result.source,
+            special_groups=specials,
+            modules=modules,
         )
         proposal["warnings"].extend(result.warnings)
     validate_proposal(package, proposal, final=False)
@@ -595,15 +862,9 @@ def _confirm_proposal(args: argparse.Namespace) -> dict[str, Any]:
         result["review"]["areasConfirmedAt"] = _now()
         result["review"]["routesConfirmed"] = False
         result["review"]["routesConfirmedAt"] = None
-        result["routePolicy"] = {
-            "confirmed": False,
-            "confirmedAt": None,
-            "useRoadNetwork": None,
-            "adjustForTime": None,
-            "writePlanNotes": None,
-            "timeBudgetMinutes": None,
-            "tradeoffNotes": None,
-        }
+        result["routePolicy"] = empty_route_policy()
+        result["transitions"] = []
+        result["stationAssist"] = empty_station_assist()
         result["journeyNotes"] = {
             "status": "not_requested",
             "preparedAt": None,
@@ -640,6 +901,8 @@ def _confirm_route_policy(args: argparse.Namespace) -> dict[str, Any]:
         write_plan_notes=args.plan_notes == "yes",
         time_budget_minutes=args.time_budget_minutes,
         tradeoff_notes=args.tradeoff_notes,
+        network_backend=args.network_backend,
+        stations_assist=args.stations_assist == "yes",
     )
     validate_proposal(package, result, final=False, stage="route-policy")
     output = save_proposal(result, args.output, force=args.force)
@@ -747,87 +1010,53 @@ def _refine(args: argparse.Namespace) -> dict[str, Any]:
         raise ProposalError(
             "Road-network evaluation was declined at the route policy gate."
         )
+    approved = route_policy.get("networkBackend") or "valhalla"
+    backend_name = args.backend or approved
+    if backend_name != approved:
+        raise ProposalError(
+            f"The route policy approved the {approved} backend, not {backend_name}."
+        )
     result = deepcopy(proposal)
-    point_by_id = {point["id"]: point for point in package.plan["points"]}
-    selected = set(args.group_id)
-    known = {group["id"] for group in result["groups"]}
-    unknown = sorted(selected - known)
+    known = [group["id"] for group in result["groups"]]
+    selected = set(known) if args.all_groups else set(args.group_id)
+    if not selected:
+        raise ProposalError("Pass --all-groups or at least one --group-id.")
+    unknown = sorted(selected - set(known))
     if unknown:
         raise ProposalError(f"Unknown --group-id values: {unknown}")
-    cache = JsonCache(args.cache_dir)
-    refined: list[str] = []
-    skipped: list[dict[str, str]] = []
-    eligible = [group for group in result["groups"] if group["id"] in selected]
-    for index, group in enumerate(eligible):
-        point_ids = group["pointIds"]
-        if len(point_ids) < 2:
-            reason = "fewer_than_2_points"
-            skipped.append({"groupId": group["id"], "reason": reason})
-            record_group_route_evaluation(
-                result,
-                group["id"],
-                status="skipped",
-                provider="fossgis_valhalla_pedestrian_matrix",
-                reason=reason,
-            )
-            continue
-        if len(point_ids) > 25:
-            reason = "more_than_25_points"
-            skipped.append({"groupId": group["id"], "reason": reason})
-            record_group_route_evaluation(
-                result,
-                group["id"],
-                status="skipped",
-                provider="fossgis_valhalla_pedestrian_matrix",
-                reason=reason,
-            )
-            continue
-        locations = [
-            {
-                "latitude": point_by_id[point_id]["latitude"],
-                "longitude": point_by_id[point_id]["longitude"],
-            }
-            for point_id in point_ids
-        ]
-        try:
-            matrix = fetch_walking_matrix(
-                locations,
-                endpoint=args.valhalla_endpoint,
-                cache=cache,
-            )
-            ordered, distance, duration = optimize_walking_order(point_ids, matrix)
-        except PublicServiceError as exc:
-            reason = str(exc)
-            skipped.append({"groupId": group["id"], "reason": reason})
-            record_group_route_evaluation(
-                result,
-                group["id"],
-                status="failed",
-                provider="fossgis_valhalla_pedestrian_matrix",
-                reason=reason,
-            )
-            continue
-        update_group_with_walking_matrix(
-            result,
-            group["id"],
-            ordered,
-            distance_meters=distance,
-            duration_seconds=duration,
-            provider="fossgis_valhalla_pedestrian_matrix",
-        )
-        refined.append(group["id"])
-        if index + 1 < len(eligible):
-            time.sleep(0.25)
-    update_walking_source_summary(
-        result,
-        provider="fossgis_valhalla_pedestrian_matrix",
+    point_by_id = {point["id"]: point for point in package.plan["points"]}
+    locations = _group_locations(result, point_by_id, selected)
+    backend = make_backend(
+        backend_name,
+        locations=locations,
+        walknet_files=args.walknet_file,
+        water_files=args.water_file,
+        overpass_endpoint=args.overpass_endpoint,
+        valhalla_endpoint=args.valhalla_endpoint,
+        valhalla_route_endpoint=args.valhalla_route_endpoint,
+        cache=JsonCache(args.cache_dir),
+        progress=_emit_progress,
     )
+    geometry: dict[str, Any] | None = {"schemaVersion": 1, "groups": {}} if args.geometry_output else None
+    summary = refine_groups(
+        package,
+        result,
+        group_ids=selected,
+        backend=backend,
+        restarts=args.restarts,
+        progress=_emit_progress,
+        geometry=geometry,
+    )
+    if backend_name == "osm":
+        result.setdefault("dataSources", {})["walking"]["network"] = backend.loaded.source
     output = save_proposal(result, args.output, force=args.force)
+    geometry_path = _write_geometry(geometry, args.geometry_output, args.force)
     return {
         "status": "walking_refinement_finished",
         "output": str(output),
-        "refinedGroupIds": refined,
-        "skipped": skipped,
+        "backend": backend_name,
+        "geometryOutput": geometry_path,
+        **summary,
     }
 
 
@@ -848,11 +1077,14 @@ def _render_preview(args: argparse.Namespace) -> dict[str, Any]:
         cache=JsonCache(args.cache_dir),
         force=args.force,
         progress=_emit_route_preview_progress,
+        mode=args.mode,
+        geometry_file=_read_json_file(args.geometry_file) if args.geometry_file else None,
     )
     return {
         "status": "route_preview_created",
         "output": str(result.output),
         "geometryMode": args.geometry,
+        "mode": args.mode,
         "noBasemap": args.no_basemap,
         "groups": result.groups,
         "routedGroups": result.routed_groups,
@@ -861,6 +1093,452 @@ def _render_preview(args: argparse.Namespace) -> dict[str, Any]:
         "unlocatedPoints": result.unlocated_points,
         "warnings": list(result.warnings),
     }
+
+
+def _plan_days(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    ensure_source_not_output(package.path, Path(args.output))
+    config = load_config(args.config)
+    base = load_proposal(args.base_proposal) if args.base_proposal else None
+    if base is not None:
+        validate_proposal(package, base, final=False, stage="draft")
+    network = config.get("network") if isinstance(config.get("network"), dict) else {}
+    backend_name = args.backend or network.get("backend") or "straight"
+    valid = [point for point in package.plan["points"] if has_valid_coordinate(point)]
+    locations = [(float(point["latitude"]), float(point["longitude"])) for point in valid]
+    cache = JsonCache(args.cache_dir)
+    warnings: list[str] = []
+    station_state: dict[str, Any] = {"source": None}
+
+    station_files = list((config.get("stations") or {}).get("files") or [])
+
+    def station_provider(pool_locations: list[tuple[float, float]]) -> list[dict[str, Any]]:
+        if station_files:
+            station_state["source"] = {"provider": "openstreetmap_overpass", "mode": "local_files", "files": station_files}
+            return stations_from_files(
+                station_files,
+                pool_locations,
+                search_meters=float(config.get("stationSearchMeters", 1_500)),
+            )
+        stations, source, station_warnings = station_candidates(
+            pool_locations,
+            search_meters=float(config.get("stationSearchMeters", 1_500)),
+            endpoint=args.overpass_endpoint,
+            cache=cache,
+        )
+        warnings.extend(station_warnings)
+        station_state["source"] = source
+        return stations
+
+    backend = make_backend(
+        backend_name,
+        locations=locations,
+        walknet_files=args.walknet_file or network.get("files") or [],
+        water_files=args.water_file or network.get("waterFiles") or [],
+        overpass_endpoint=args.overpass_endpoint,
+        valhalla_endpoint=args.valhalla_endpoint,
+        valhalla_route_endpoint=args.valhalla_route_endpoint,
+        cache=cache,
+        speed=float(config.get("speedMetersPerSecond", 1.2)),
+        progress=_emit_progress,
+    )
+    geometry: dict[str, Any] | None = {"schemaVersion": 1, "groups": {}} if args.geometry_output else None
+    modules = sorted({*_parse_modules(args.modules), "day-route"} | ({"osm-network"} if backend_name == "osm" else set()))
+    proposal, report = plan_days(
+        package,
+        config,
+        backend=backend,
+        station_provider=station_provider,
+        base_proposal=base,
+        modules=modules,
+        geometry=geometry,
+        progress=_emit_progress,
+    )
+    proposal["warnings"].extend(warnings)
+    if station_state["source"]:
+        proposal["dataSources"]["stations"] = station_state["source"]
+    if backend_name == "osm":
+        proposal["dataSources"]["walking"]["network"] = backend.loaded.source
+    validate_proposal(package, proposal, final=False, stage="draft")
+    output = save_proposal(proposal, args.output, force=args.force)
+    geometry_path = _write_geometry(geometry, args.geometry_output, args.force)
+    return {
+        "status": "draft_proposal_created",
+        "output": str(output),
+        "backend": backend_name,
+        "geometryOutput": geometry_path,
+        "areas": report,
+        **proposal_summary(proposal),
+        "warnings": proposal.get("warnings", []),
+        "nextGate": "Render the area preview, review every day and area, then stop at the area gate.",
+    }
+
+
+def _assist_stations(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    ensure_source_not_output(package.path, Path(args.output))
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="route-policy")
+    if proposal["routePolicy"].get("stationsAssist") is not True:
+        raise ProposalError("Station assistance was not approved at the route policy gate.")
+    result = deepcopy(proposal)
+    point_by_id = {point["id"]: point for point in package.plan["points"]}
+    locations = _group_locations(result, point_by_id, {group["id"] for group in result["groups"]})
+    cache = JsonCache(args.cache_dir)
+    if args.station_file:
+        stations = stations_from_files(args.station_file, locations, search_meters=args.max_access_meters)
+        source = {"provider": "openstreetmap_overpass", "mode": "local_files", "files": args.station_file}
+        warnings: list[str] = []
+    else:
+        stations, source, warnings = station_candidates(
+            locations,
+            search_meters=args.max_access_meters,
+            endpoint=args.overpass_endpoint,
+            cache=cache,
+        )
+    lines, line_warnings = fetch_station_lines(stations, endpoint=args.overpass_endpoint, cache=cache)
+    summary = assist_stations(
+        package,
+        result,
+        stations=stations,
+        lines=lines,
+        walk_threshold_meters=args.walk_threshold_meters,
+        max_access_meters=args.max_access_meters,
+        source=source,
+    )
+    if result["routePolicy"].get("useRoadNetwork") is not True:
+        from miriago_planner.walking import StraightBackend
+
+        refine_groups(
+            package,
+            result,
+            group_ids={group_id for group_id in summary["changedGroupIds"]},
+            backend=StraightBackend(),
+        )
+        for group in result["groups"]:
+            group.pop("routeEvaluation", None)
+            metrics = group.get("metrics") or {}
+            for key in ("walkingPathMeters", "walkingDurationSeconds", "routedStopCount", "accessMeters"):
+                metrics.pop(key, None)
+            metrics["walkingEstimateMethod"] = "haversine_path_x_1.25"
+            for item in (group.get("access") or {}).values():
+                item["estimate"] = "haversine_x_1.3"
+        result["dataSources"]["walking"] = {
+            "provider": "local",
+            "method": "haversine_path_x_1.25",
+            "status": "rough_estimate",
+        }
+    validate_proposal(package, result, final=False, stage="route-policy")
+    output = save_proposal(result, args.output, force=args.force)
+    return {
+        "status": "stations_assisted",
+        "output": str(output),
+        "stationsFound": len(stations),
+        **summary,
+        "warnings": warnings + line_warnings + summary["warnings"],
+        "next": "Run refine for changedGroupIds (or --all-groups) before route review."
+        if result["routePolicy"].get("useRoadNetwork")
+        else "Review the station ends and transitions at the route gate.",
+    }
+
+
+def _draft_notes_spec(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="route-policy")
+    spec = draft_notes_spec(
+        proposal,
+        checked_at=args.checked_at,
+        timezone_name=args.timezone,
+        title=args.title,
+    )
+    target = Path(args.output).expanduser().resolve()
+    if target.exists() and not args.force:
+        raise ProposalError(f"Output already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(spec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "status": "journey_notes_skeleton_written",
+        "output": str(target),
+        "segments": len(spec["segments"]),
+        "next": "Fill durations, fares, and official sources (or user-confirmed details) before prepare-notes.",
+    }
+
+
+def _serve_review(args: argparse.Namespace) -> dict[str, Any]:
+    serve_review(args.preview, db=args.db, package=args.package, port=args.port)
+    return {"status": "review_server_stopped"}
+
+
+def _apply_review(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    ensure_source_not_output(package.path, Path(args.output))
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="draft")
+    decisions = load_decisions(args.db or args.decisions)
+    result = deepcopy(proposal)
+    assigned = {
+        point_id
+        for group in result["groups"]
+        for point_id in group.get("pointIds", [])
+    }
+    curated = {
+        item.get("pointId")
+        for item in result.get("excludedPoints", [])
+        if isinstance(item, dict) and item.get("kind") == "curation"
+    }
+    restore = sorted(point_id for point_id in curated if decisions.get(point_id) != "delete")
+    restored = restore_curated_points(package, result, restore)
+    remove = sorted(
+        point_id
+        for point_id, decision in decisions.items()
+        if decision == "delete" and point_id in assigned and point_id not in curated
+    )
+    exclude_points_for_curation(package, result, [(point_id, args.reason) for point_id in remove])
+    known = {point["id"] for point in package.plan["points"]}
+    validate_proposal(package, result, final=False, stage="draft")
+    output = save_proposal(result, args.output, force=args.force)
+    return {
+        "status": "curation_review_required",
+        "output": str(output),
+        "removed": len(remove),
+        "restored": len(restored),
+        "kept": sum(1 for decision in decisions.values() if decision == "keep"),
+        "unknownDecisionIds": sorted(set(decisions) - known)[:20],
+        **proposal_summary(result),
+        "nextGate": "Present the removals per area and wait for explicit approval, then run confirm-curation.",
+    }
+
+
+def _confirm_curation(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    ensure_source_not_output(package.path, Path(args.output))
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="draft")
+    result = deepcopy(proposal)
+    result["review"]["curationConfirmed"] = True
+    result["review"]["curationConfirmedAt"] = _now()
+    validate_proposal(package, result, final=False, stage="draft")
+    output = save_proposal(result, args.output, force=args.force)
+    return {"status": "curation_confirmed", "output": str(output), **proposal_summary(result)}
+
+
+def _dedupe_candidates(args: argparse.Namespace) -> dict[str, Any]:
+    draft_path = Path(args.draft).expanduser().resolve()
+    draft = load_import_proposal(draft_path)
+    output_dir = _fresh_dir(args.output_dir, args.force)
+    result = write_dedupe_batch(
+        draft_path,
+        draft_points(draft),
+        output_dir,
+        meters=args.meters,
+        thumbnails=_thumbnails(args),
+    )
+    return {
+        "status": "dedupe_review_required",
+        **result,
+        "next": "Compare each group (subagents or the picker page dedupe-review.html), write decisions.json, then apply-dedupe.",
+    }
+
+
+def _apply_dedupe(args: argparse.Namespace) -> dict[str, Any]:
+    draft = load_import_proposal(args.draft)
+    candidates = _read_json_file(args.candidates)
+    if candidates.get("source", {}).get("sha256") != hashlib.sha256(Path(args.draft).expanduser().read_bytes()).hexdigest():
+        raise CurationError("Dedupe candidates were built from a different import draft.")
+    result, log = apply_dedupe(draft, candidates, _read_json_file(args.decisions))
+    validate_import_proposal(None if draft.get("base") is None else load_package(draft["base"]["path"]), result, final=False)
+    output = save_import_proposal(result, args.output, force=args.force)
+    return {
+        "status": "import_review_required",
+        "output": str(output),
+        "removed": len(log["removed"]),
+        "annotated": len(log["annotated"]),
+        **import_proposal_summary(result),
+    }
+
+
+def _verify_batches(args: argparse.Namespace) -> dict[str, Any]:
+    draft_path = Path(args.draft).expanduser().resolve()
+    draft = load_import_proposal(draft_path)
+    output_dir = _fresh_dir(args.output_dir, args.force)
+    result = write_verify_batches(
+        draft_path,
+        draft_points(draft),
+        output_dir,
+        meters=args.meters,
+        batch_points=args.batch_points,
+        thumbnails=_thumbnails(args),
+    )
+    return {
+        "status": "verification_batches_written",
+        **result,
+        "next": "Check each batch (subagents with their own built-in browser), write <batch>/verify.json, then apply-verify.",
+    }
+
+
+def _apply_verify(args: argparse.Namespace) -> dict[str, Any]:
+    draft_path = Path(args.draft).expanduser().resolve()
+    draft = load_import_proposal(draft_path)
+    pairs = []
+    missing = []
+    for folder in sorted(Path(args.batches_dir).expanduser().glob("V*")):
+        batch_input = _read_json_file(folder / "input.json")
+        if batch_input.get("source", {}).get("sha256") != hashlib.sha256(draft_path.read_bytes()).hexdigest():
+            raise CurationError(f"{folder.name} was built from a different import draft.")
+        if not (folder / "verify.json").exists():
+            missing.append(folder.name)
+            continue
+        pairs.append((batch_input, _read_json_file(folder / "verify.json")))
+    if missing:
+        raise CurationError(f"Batches without verify.json: {missing}")
+    result, log = apply_verify(draft, pairs)
+    output = save_import_proposal(result, args.output, force=args.force)
+    specials_path = None
+    if args.special_groups_output and log["unverifiable"]:
+        target = Path(args.special_groups_output).expanduser().resolve()
+        if target.exists() and not args.force:
+            raise CurationError(f"Output already exists: {target}")
+        target.write_text(
+            json.dumps(unverified_special_group(log["unverifiable"]), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        specials_path = str(target)
+    return {
+        "status": "import_review_required",
+        "output": str(output),
+        **{key: len(value) for key, value in log.items()},
+        "specialGroupsOutput": specials_path,
+        **import_proposal_summary(result),
+    }
+
+
+def _classify_batches(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="draft")
+    output_dir = _fresh_dir(args.output_dir, args.force)
+    args.package = args.package or args.input
+    result = write_classify_batches(
+        package,
+        proposal,
+        output_dir,
+        meters=args.meters,
+        batch_points=args.batch_points,
+        thumbnails=_thumbnails(args, package=package),
+    )
+    return {
+        "status": "classification_batches_written",
+        **result,
+        "next": "Classify each batch (prefer shootable shots and famous scenes), write <batch>/classify.json, then merge-classify.",
+    }
+
+
+def _merge_classify(args: argparse.Namespace) -> dict[str, Any]:
+    package = load_package(args.input)
+    ensure_source_not_output(package.path, Path(args.output))
+    proposal = load_proposal(args.proposal)
+    validate_proposal(package, proposal, final=False, stage="draft")
+    results = []
+    missing = []
+    for folder in sorted(Path(args.batches_dir).expanduser().glob("C*")):
+        if (folder / "classify.json").exists():
+            results.append(_read_json_file(folder / "classify.json"))
+        else:
+            missing.append(folder.name)
+    if missing:
+        raise CurationError(f"Batches without classify.json: {missing}")
+    merged, counts = merge_classify(proposal, results, {point["id"] for point in package.plan["points"]})
+    if "classify" not in merged.get("modules", []):
+        merged["modules"] = sorted({*merged.get("modules", []), "classify"})
+    output = save_proposal(merged, args.output, force=args.force)
+    return {"status": "review_hints_merged", "output": str(output), "counts": counts}
+
+
+def _special_groups(package: Any, path: str | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    value = _read_json_file(path)
+    if not isinstance(value, list):
+        raise ProposalError("--special-groups must be a JSON list.")
+    point_by_id = {point["id"]: point for point in package.plan["points"]}
+    remaining = [point["id"] for point in package.plan["points"] if has_valid_coordinate(point)]
+    groups = []
+    for index, item in enumerate(value):
+        if (
+            not isinstance(item, dict)
+            or item.get("kind") not in {"restricted", "unverified"}
+            or not str(item.get("name") or "").strip()
+        ):
+            raise ProposalError(f"special group {index} needs kind restricted|unverified and a name.")
+        selector = item.get("select") or {"pointIds": item.get("pointIds", [])}
+        ids = select_points(selector, remaining, point_by_id, {})
+        if not ids:
+            continue
+        remaining = [point_id for point_id in remaining if point_id not in set(ids)]
+        groups.append({"kind": item["kind"], "name": item["name"], "pointIds": ids, "note": item.get("note")})
+    return groups
+
+
+def _group_locations(
+    proposal: dict[str, Any],
+    point_by_id: dict[str, Any],
+    group_ids: set[str],
+) -> list[tuple[float, float]]:
+    locations = [
+        (float(point_by_id[point_id]["latitude"]), float(point_by_id[point_id]["longitude"]))
+        for group in proposal["groups"]
+        if group["id"] in group_ids
+        for point_id in group.get("pointIds", [])
+    ]
+    for group in proposal["groups"]:
+        ends = group.get("routeEnds") or {}
+        for side in ("start", "end"):
+            end = ends.get(side) if isinstance(ends, dict) else None
+            if isinstance(end, dict) and "latitude" in end:
+                locations.append((float(end["latitude"]), float(end["longitude"])))
+    for rule in (proposal.get("constraints") or {}).get("via", []) or []:
+        locations.append((float(rule["latitude"]), float(rule["longitude"])))
+    return locations
+
+
+def _thumbnails(args: argparse.Namespace, package: Any = None) -> ThumbnailSource:
+    source_package = package or (load_package(args.package) if getattr(args, "package", None) else None)
+    return ThumbnailSource(
+        package=source_package,
+        cache_dir=Path(args.cache_dir) / "thumbnails" if args.cache_dir else None,
+        download=not args.no_download,
+    )
+
+
+def _fresh_dir(path: str, force: bool) -> Path:
+    target = Path(path).expanduser().resolve()
+    if target.exists() and any(target.iterdir()) and not force:
+        raise CurationError(f"Output directory is not empty: {target} (use --force to reuse it)")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _read_json_file(path: str | Path) -> Any:
+    try:
+        return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read JSON {path}: {exc}") from exc
+
+
+def _write_geometry(geometry: dict[str, Any] | None, path: str | None, force: bool) -> str | None:
+    if geometry is None or not path:
+        return None
+    target = Path(path).expanduser().resolve()
+    if target.exists() and not force:
+        raise ProposalError(f"Geometry output already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(geometry, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return str(target)
+
+
+def _emit_progress(event: dict[str, Any]) -> None:
+    print(json.dumps(event, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
 def _apply(args: argparse.Namespace) -> dict[str, Any]:
@@ -935,7 +1613,7 @@ def _validate_package(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _emit_image_download_progress(event: dict[str, Any]) -> None:
@@ -960,8 +1638,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = args.handler(args)
     except (
+        CurationError,
         ImportProposalError,
         JourneyNotesError,
+        ReviewStoreError,
         NetworkError,
         PackageError,
         ProposalError,

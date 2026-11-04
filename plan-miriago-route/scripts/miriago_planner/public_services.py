@@ -10,25 +10,31 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .clustering import haversine_meters, order_open_path
+from .clustering import haversine_meters
+from .routing import solve_open_path
 
 DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
 DEFAULT_VALHALLA_ENDPOINT = "https://valhalla1.openstreetmap.de/sources_to_targets"
 DEFAULT_VALHALLA_ROUTE_ENDPOINT = "https://valhalla1.openstreetmap.de/route"
-USER_AGENT = "plan-miriago-route/1.7"
+USER_AGENT = "plan-miriago-route/2.0"
 VALHALLA_CLIENT_ID = "plan-miriago-route"
 DEFAULT_CACHE_DAYS = 7
 MAX_STATION_BOXES_PER_QUERY = 30
-MAX_WALKING_MATRIX_POINTS = 25
-MAX_WALKING_ROUTE_POINTS = 25
+# The public FOSSGIS Valhalla instance accepts at most 100 matrix cells per
+# request and 10 locations per route, so larger requests are tiled.
+VALHALLA_MAX_MATRIX_ELEMENTS = 100
+VALHALLA_MAX_ROUTE_LOCATIONS = 10
+MAX_WALKING_MATRIX_POINTS = 60
+MAX_WALKING_ROUTE_POINTS = 400
 
 
 class PublicServiceError(RuntimeError):
@@ -69,8 +75,8 @@ class JsonCache:
         path = self._path(namespace, key)
         try:
             stat = path.stat()
-            if datetime.now(timezone.utc) - datetime.fromtimestamp(
-                stat.st_mtime, timezone.utc
+            if datetime.now(UTC) - datetime.fromtimestamp(
+                stat.st_mtime, UTC
             ) > timedelta(days=max_age_days):
                 return None
             return json.loads(path.read_text(encoding="utf-8"))
@@ -410,6 +416,8 @@ def fetch_walking_matrix(
     timeout_seconds: float = 45,
     cache_days: int = DEFAULT_CACHE_DAYS,
     requester: Callable[..., Any] = urlopen,
+    max_elements: int = VALHALLA_MAX_MATRIX_ELEMENTS,
+    request_delay_seconds: float = 0.25,
 ) -> WalkingMatrix:
     if not 2 <= len(locations) <= MAX_WALKING_MATRIX_POINTS:
         raise PublicServiceError(
@@ -422,40 +430,64 @@ def fetch_walking_matrix(
         }
         for location in locations
     ]
-    payload = {
-        "sources": normalized,
-        "targets": normalized,
-        "costing": "pedestrian",
-        "units": "kilometers",
-        "verbose": False,
-    }
-    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    size = len(normalized)
+    side = max(1, math.isqrt(max_elements))
+    blocks = [list(range(start, min(size, start + side))) for start in range(0, size, side)]
+    distances = [[math.inf] * size for _ in range(size)]
+    durations = [[math.inf] * size for _ in range(size)]
     cache_value = cache or JsonCache()
-    cache_key = _cache_key(endpoint, serialized)
-    response = cache_value.get("valhalla", cache_key, cache_days)
-    cache_hit = response is not None
-    if response is None:
-        response = _post_json(
-            endpoint,
-            payload,
-            timeout_seconds=timeout_seconds,
-            requester=requester,
-            headers={"X-Client-Id": VALHALLA_CLIENT_ID},
-        )
-        cache_value.put("valhalla", cache_key, response)
-    distances, durations = parse_valhalla_matrix(response, len(locations))
+    all_hits = True
+    requests = 0
+    for sources in blocks:
+        for targets in blocks:
+            payload = {
+                "sources": [normalized[index] for index in sources],
+                "targets": [normalized[index] for index in targets],
+                "costing": "pedestrian",
+                "units": "kilometers",
+                "verbose": False,
+            }
+            serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            cache_key = _cache_key(endpoint, serialized)
+            response = cache_value.get("valhalla", cache_key, cache_days)
+            if response is None:
+                all_hits = False
+                if requests and request_delay_seconds > 0:
+                    time.sleep(request_delay_seconds)
+                response = _post_json(
+                    endpoint,
+                    payload,
+                    timeout_seconds=timeout_seconds,
+                    requester=requester,
+                    headers={"X-Client-Id": VALHALLA_CLIENT_ID},
+                )
+                requests += 1
+                cache_value.put("valhalla", cache_key, response)
+            tile_distances, tile_durations = parse_valhalla_matrix(
+                response, len(sources), columns=len(targets)
+            )
+            for row, source in enumerate(sources):
+                for column, target in enumerate(targets):
+                    distances[source][target] = tile_distances[row][column]
+                    durations[source][target] = tile_durations[row][column]
+    for index in range(size):
+        distances[index][index] = 0.0
+        durations[index][index] = 0.0
     return WalkingMatrix(
         distances_meters=distances,
         durations_seconds=durations,
         endpoint=endpoint,
-        cache_hit=cache_hit,
+        cache_hit=all_hits,
     )
 
 
 def parse_valhalla_matrix(
     response: Any,
     size: int,
+    *,
+    columns: int | None = None,
 ) -> tuple[list[list[float]], list[list[float]]]:
+    width = size if columns is None else columns
     if not isinstance(response, dict):
         raise PublicServiceError("Valhalla response must be an object.")
     body = response.get("sources_to_targets")
@@ -463,8 +495,8 @@ def parse_valhalla_matrix(
         raw_distances = body.get("distances")
         raw_durations = body.get("durations")
     elif isinstance(body, list):
-        raw_distances = [[None for _ in range(size)] for _ in range(size)]
-        raw_durations = [[None for _ in range(size)] for _ in range(size)]
+        raw_distances = [[None for _ in range(width)] for _ in range(size)]
+        raw_durations = [[None for _ in range(width)] for _ in range(size)]
         for item in body:
             if not isinstance(item, dict):
                 continue
@@ -475,8 +507,8 @@ def parse_valhalla_matrix(
                 raw_durations[source][target] = item.get("time")
     else:
         raise PublicServiceError("Valhalla response has no matrix result.")
-    distances = _numeric_matrix(raw_distances, size, scale=1_000)
-    durations = _numeric_matrix(raw_durations, size, scale=1)
+    distances = _numeric_matrix(raw_distances, size, width, scale=1_000)
+    durations = _numeric_matrix(raw_durations, size, width, scale=1)
     return distances, durations
 
 
@@ -488,8 +520,14 @@ def fetch_walking_route(
     timeout_seconds: float = 45,
     cache_days: int = DEFAULT_CACHE_DAYS,
     requester: Callable[..., Any] = urlopen,
+    max_locations: int = VALHALLA_MAX_ROUTE_LOCATIONS,
+    request_delay_seconds: float = 0.25,
 ) -> WalkingRoute:
-    """Return a pedestrian road shape through locations in their given order."""
+    """Return a pedestrian road shape through locations in their given order.
+
+    Long routes are split into overlapping chunks that respect the public
+    server's location limit and are joined at the shared location.
+    """
     if not 2 <= len(locations) <= MAX_WALKING_ROUTE_POINTS:
         raise PublicServiceError(
             f"Walking route requires 2–{MAX_WALKING_ROUTE_POINTS} locations."
@@ -501,33 +539,49 @@ def fetch_walking_route(
         }
         for location in locations
     ]
-    payload = {
-        "locations": normalized,
-        "costing": "pedestrian",
-        "units": "kilometers",
-        "shape_format": "polyline6",
-    }
-    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    step = max(2, max_locations) - 1
+    chunks = [
+        normalized[start : start + step + 1]
+        for start in range(0, len(normalized) - 1, step)
+    ]
     cache_value = cache or JsonCache()
-    cache_key = _cache_key(endpoint, serialized)
-    response = cache_value.get("valhalla-route", cache_key, cache_days)
-    cache_hit = response is not None
-    if response is None:
-        response = _post_json(
-            endpoint,
-            payload,
-            timeout_seconds=timeout_seconds,
-            requester=requester,
-            headers={"X-Client-Id": VALHALLA_CLIENT_ID},
-        )
-        coordinates = parse_valhalla_route(response)
-        cache_value.put("valhalla-route", cache_key, response)
-    else:
-        coordinates = parse_valhalla_route(response)
+    coordinates: list[tuple[float, float]] = []
+    all_hits = True
+    requests = 0
+    for chunk in chunks:
+        payload = {
+            "locations": chunk,
+            "costing": "pedestrian",
+            "units": "kilometers",
+            "shape_format": "polyline6",
+        }
+        serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        cache_key = _cache_key(endpoint, serialized)
+        response = cache_value.get("valhalla-route", cache_key, cache_days)
+        if response is None:
+            all_hits = False
+            if requests and request_delay_seconds > 0:
+                time.sleep(request_delay_seconds)
+            response = _post_json(
+                endpoint,
+                payload,
+                timeout_seconds=timeout_seconds,
+                requester=requester,
+                headers={"X-Client-Id": VALHALLA_CLIENT_ID},
+            )
+            requests += 1
+            chunk_coordinates = parse_valhalla_route(response)
+            cache_value.put("valhalla-route", cache_key, response)
+        else:
+            chunk_coordinates = parse_valhalla_route(response)
+        if coordinates and chunk_coordinates[0] == coordinates[-1]:
+            coordinates.extend(chunk_coordinates[1:])
+        else:
+            coordinates.extend(chunk_coordinates)
     return WalkingRoute(
-        geojson_coordinates=coordinates,
+        geojson_coordinates=tuple(coordinates),
         endpoint=endpoint,
-        cache_hit=cache_hit,
+        cache_hit=all_hits,
     )
 
 
@@ -596,11 +650,17 @@ def _decode_polyline_value(value: str, index: int) -> tuple[int, int]:
     return delta, index
 
 
-def _numeric_matrix(value: Any, size: int, *, scale: float) -> list[list[float]]:
+def _numeric_matrix(
+    value: Any,
+    size: int,
+    width: int,
+    *,
+    scale: float,
+) -> list[list[float]]:
     if (
         not isinstance(value, list)
         or len(value) != size
-        or any(not isinstance(row, list) or len(row) != size for row in value)
+        or any(not isinstance(row, list) or len(row) != width for row in value)
     ):
         raise PublicServiceError("Valhalla matrix has unexpected dimensions.")
     result: list[list[float]] = []
@@ -608,7 +668,9 @@ def _numeric_matrix(value: Any, size: int, *, scale: float) -> list[list[float]]
         converted: list[float] = []
         for column_index, cell in enumerate(row):
             if cell is None:
-                converted.append(0.0 if row_index == column_index else math.inf)
+                converted.append(
+                    0.0 if size == width and row_index == column_index else math.inf
+                )
             elif isinstance(cell, bool) or not isinstance(cell, (int, float)):
                 raise PublicServiceError("Valhalla matrix contains a non-number.")
             else:
@@ -623,10 +685,7 @@ def optimize_walking_order(
 ) -> tuple[list[str], float, float]:
     if len(point_ids) != len(matrix.distances_meters):
         raise PublicServiceError("Point IDs and walking matrix dimensions differ.")
-    order = order_open_path(
-        list(range(len(point_ids))),
-        matrix.distances_meters,
-    )
+    order = solve_open_path(matrix.distances_meters)
     distance = _ordered_total(matrix.distances_meters, order)
     duration = _ordered_total(matrix.durations_seconds, order)
     if not math.isfinite(distance) or not math.isfinite(duration):
@@ -640,7 +699,32 @@ def _ordered_total(matrix: Sequence[Sequence[float]], order: Sequence[int]) -> f
     return sum(matrix[left][right] for left, right in zip(order, order[1:]))
 
 
+RETRY_STATUS = ("HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504")
+OVERPASS_RETRY_DELAYS = (3.0, 8.0, 20.0)
+
+
 def _post_form_json(
+    endpoint: str,
+    values: Mapping[str, str],
+    *,
+    timeout_seconds: float,
+    requester: Callable[..., Any],
+    retry_delays: Sequence[float] | None = None,
+) -> Any:
+    """POST a form (Overpass) and retry briefly when the server is overloaded."""
+    delays = list(OVERPASS_RETRY_DELAYS if retry_delays is None else retry_delays)
+    while True:
+        try:
+            return _post_form_json_once(
+                endpoint, values, timeout_seconds=timeout_seconds, requester=requester
+            )
+        except PublicServiceError as exc:
+            if not delays or not str(exc).startswith(RETRY_STATUS):
+                raise
+            time.sleep(delays.pop(0))
+
+
+def _post_form_json_once(
     endpoint: str,
     values: Mapping[str, str],
     *,

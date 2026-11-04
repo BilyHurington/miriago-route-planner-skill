@@ -89,6 +89,18 @@ non-negative `min` and `max`. `walkingMinutes`, `transferMinutes`, and
 Every non-walking segment requires `source.provider`. `source.url` is optional
 but, when present, must be HTTP(S). Confidence is `high`, `medium`, or `low`.
 
+## Station skeleton
+
+With the `stations-assist` module, `draft-notes-spec` writes a starting spec:
+day summaries ("Day1，从 X 出发，在 Y 结束") and one segment per rail or
+unknown transition with stations, candidate line names, a low confidence, and
+an OpenStreetMap geography source. It never fills `durationMinutes` or `fare`;
+add them only from official sources or user-confirmed details, or leave them
+out and say so at the journey-note gate.
+
+The renderer groups area walking under day headings when areas carry a `day`,
+and lists station entry/exit walks recorded by refinement.
+
 ## Merge behavior
 
 The renderer uses managed start and end markers. On first write it appends the

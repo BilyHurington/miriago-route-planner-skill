@@ -1,6 +1,6 @@
 {
   "name": "miriago-route-planner-skill",
-  "version": "1.7.0",
+  "version": "2.0.0",
   "description": "Agent Skill for importing pilgrimage points, visualizing and reviewing routes, and exporting MiriaGo v2 packages in Codex, Pi, and Claude Code.",
   "license": "MIT",
   "keywords": [

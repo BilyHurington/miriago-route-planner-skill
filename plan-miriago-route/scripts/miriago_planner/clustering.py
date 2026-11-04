@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import heapq
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from statistics import median
-from typing import Iterable, Sequence
 
 EARTH_RADIUS_METERS = 6_371_008.8
 
@@ -78,6 +79,7 @@ def profile_with_overrides(
     max_points: int | None = None,
     max_radius_meters: float | None = None,
     hard_link_meters: float | None = None,
+    bundle_distance_meters: float | None = None,
 ) -> PlanningProfile:
     try:
         source = PROFILES[name]
@@ -89,9 +91,11 @@ def profile_with_overrides(
         raise ValueError("max_radius_meters must be positive")
     if hard_link_meters is not None and hard_link_meters <= 0:
         raise ValueError("hard_link_meters must be positive")
+    if bundle_distance_meters is not None and not 0 < bundle_distance_meters <= 200:
+        raise ValueError("bundle_distance_meters must be between 0 and 200")
     return PlanningProfile(
         name=source.name,
-        bundle_distance_meters=source.bundle_distance_meters,
+        bundle_distance_meters=bundle_distance_meters or source.bundle_distance_meters,
         hard_link_meters=hard_link_meters or source.hard_link_meters,
         max_radius_p90_meters=max_radius_meters or source.max_radius_p90_meters,
         max_diameter_meters=max(
@@ -162,22 +166,31 @@ def bundle_points(
     points: Sequence[GeoPoint],
     threshold_meters: float,
 ) -> list[GeoPoint]:
+    """Merge near-identical scenes into stops with complete linkage.
+
+    Every pair inside one stop is at most ``threshold_meters`` apart. Single
+    linkage would chain points along a bridge or a street into one huge stop.
+    """
     if not points:
         return []
-    matrix = distance_matrix(points)
+    neighbors = _close_pairs(points, threshold_meters)
     union_find = _UnionFind(len(points))
-    for left in range(len(points)):
-        for right in range(left + 1, len(points)):
-            if matrix[left][right] <= threshold_meters:
-                union_find.union(left, right)
-
-    members: dict[int, list[int]] = {}
+    for left, right, _ in neighbors:
+        union_find.union(left, right)
+    components: dict[int, list[int]] = {}
     for index in range(len(points)):
-        members.setdefault(union_find.find(index), []).append(index)
+        components.setdefault(union_find.find(index), []).append(index)
+    pair_distance = {(left, right): value for left, right, value in neighbors}
+
+    members_list: list[list[int]] = []
+    for component in components.values():
+        members_list.extend(
+            _complete_linkage(sorted(component), pair_distance, threshold_meters)
+        )
 
     bundled: list[GeoPoint] = []
-    for indices in sorted(members.values(), key=lambda values: points[min(values)].key):
-        source_points = [points[index] for index in indices]
+    for indices in sorted(members_list, key=lambda values: points[min(values)].key):
+        source_points = [points[index] for index in sorted(indices)]
         point_ids = tuple(
             point_id for point in source_points for point_id in point.point_ids
         )
@@ -191,6 +204,91 @@ def bundle_points(
             )
         )
     return bundled
+
+
+def _close_pairs(
+    points: Sequence[GeoPoint],
+    threshold_meters: float,
+) -> list[tuple[int, int, float]]:
+    """Return index pairs within the threshold using a coarse metric grid."""
+    if threshold_meters <= 0:
+        return []
+    if any(abs(point.longitude) > 179.5 for point in points):
+        # Grid cells use a local longitude scale; near the dateline compare all.
+        matrix = distance_matrix(points)
+        return [
+            (left, right, matrix[left][right])
+            for left in range(len(points))
+            for right in range(left + 1, len(points))
+            if matrix[left][right] <= threshold_meters
+        ]
+    cell_size = max(threshold_meters, 1.0)
+    grid: dict[tuple[int, int], list[int]] = {}
+    keys: list[tuple[int, int]] = []
+    for index, point in enumerate(points):
+        y = point.latitude * 111_320.0
+        x = point.longitude * 111_320.0 * math.cos(math.radians(point.latitude))
+        key = (math.floor(x / cell_size), math.floor(y / cell_size))
+        keys.append(key)
+        grid.setdefault(key, []).append(index)
+    pairs: list[tuple[int, int, float]] = []
+    for index, (cell_x, cell_y) in enumerate(keys):
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for other in grid.get((cell_x + dx, cell_y + dy), ()):
+                    if other <= index:
+                        continue
+                    distance = haversine_meters(
+                        points[index].latitude,
+                        points[index].longitude,
+                        points[other].latitude,
+                        points[other].longitude,
+                    )
+                    if distance <= threshold_meters:
+                        pairs.append((index, other, distance))
+    return pairs
+
+
+def _complete_linkage(
+    indices: Sequence[int],
+    pair_distance: dict[tuple[int, int], float],
+    threshold_meters: float,
+) -> list[list[int]]:
+    if len(indices) == 1:
+        return [list(indices)]
+    clusters: dict[int, list[int]] = {index: [index] for index in indices}
+    index_set = set(indices)
+    # Only links within the threshold can ever merge, and complete linkage
+    # never shrinks a link, so the heap holds just those candidates.
+    linkage = {
+        key: value
+        for key, value in pair_distance.items()
+        if key[0] in index_set and value <= threshold_meters
+    }
+    heap = [(value, left, right) for (left, right), value in linkage.items()]
+    heapq.heapify(heap)
+    while heap:
+        value, left, right = heapq.heappop(heap)
+        if linkage.get((left, right)) != value:
+            continue
+        keep, absorb = left, right
+        clusters[keep].extend(clusters.pop(absorb))
+        linkage.pop((left, right), None)
+        for other in list(clusters):
+            if other == keep:
+                continue
+            first = linkage.pop(_linkage_key(keep, other), math.inf)
+            second = linkage.pop(_linkage_key(absorb, other), math.inf)
+            merged = max(first, second)
+            if merged <= threshold_meters:
+                key = _linkage_key(keep, other)
+                linkage[key] = merged
+                heapq.heappush(heap, (merged, key[0], key[1]))
+    return [sorted(members) for members in clusters.values()]
+
+
+def _linkage_key(left: int, right: int) -> tuple[int, int]:
+    return (left, right) if left < right else (right, left)
 
 
 def _mean_longitude(longitudes: Sequence[float]) -> float:
@@ -506,66 +604,10 @@ def order_open_path(
         ):
             return [right, left]
         return [left, right]
-    start, end = _farthest_pair(indices, matrix)
-    candidates = [
-        _greedy_path(indices, matrix, start, end),
-        _greedy_path(indices, matrix, end, start),
-    ]
-    optimized = [_two_opt_open(path, matrix) for path in candidates]
-    return min(
-        optimized,
-        key=lambda path: (
-            path_length(path, matrix),
-            tuple(path),
-        ),
-    )
+    from .routing import solve_open_path
 
-
-def _greedy_path(
-    indices: Sequence[int],
-    matrix: Sequence[Sequence[float]],
-    start: int,
-    end: int,
-) -> list[int]:
-    remaining = set(indices)
-    remaining.remove(start)
-    remaining.remove(end)
-    path = [start]
-    current = start
-    while remaining:
-        next_index = min(remaining, key=lambda value: (matrix[current][value], value))
-        path.append(next_index)
-        remaining.remove(next_index)
-        current = next_index
-    path.append(end)
-    return path
-
-
-def _two_opt_open(
-    path: list[int],
-    matrix: Sequence[Sequence[float]],
-) -> list[int]:
-    best = list(path)
-    best_length = path_length(best, matrix)
-    changed = True
-    while changed:
-        changed = False
-        for left in range(0, len(best) - 2):
-            for right in range(left + 2, len(best)):
-                candidate = (
-                    best[: left + 1]
-                    + list(reversed(best[left + 1 : right + 1]))
-                    + best[right + 1 :]
-                )
-                candidate_length = path_length(candidate, matrix)
-                if candidate_length + 1e-9 < best_length:
-                    best = candidate
-                    best_length = candidate_length
-                    changed = True
-                    break
-            if changed:
-                break
-    return best
+    local = [[matrix[left][right] for right in indices] for left in indices]
+    return [indices[position] for position in solve_open_path(local)]
 
 
 def path_length(

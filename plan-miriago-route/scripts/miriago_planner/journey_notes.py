@@ -6,8 +6,9 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlparse
 
 JOURNEY_NOTES_SCHEMA_VERSION = 1
@@ -122,8 +123,16 @@ def render_journey_notes(
         groups = proposal.get("groups", [])
         if not groups:
             lines.append("- 当前没有可展示的片区。")
+        current_day = None
         for group in groups:
             if isinstance(group, Mapping):
+                day = group.get("day") if isinstance(group.get("day"), Mapping) else None
+                label = day.get("label") if day else None
+                if label and label != current_day:
+                    theme = day.get("theme")
+                    heading = f"{label} · {theme}" if theme else str(label)
+                    lines.extend(["", f"**{_markdown_text(heading)}**"])
+                current_day = label
                 lines.extend(_render_group_walking(group))
 
     segments = spec.get("segments", [])
@@ -194,10 +203,16 @@ def route_fingerprint(proposal: Mapping[str, Any]) -> str:
                 "routeEvaluation": group.get("routeEvaluation"),
             }
         )
+        for optional in ("day", "routeEnds", "access", "kind"):
+            value = group.get(optional)
+            if value and not (optional == "kind" and value == "route"):
+                groups[-1][optional] = value
     material = {
         "groups": groups,
         "excludedPoints": proposal.get("excludedPoints", []),
     }
+    if proposal.get("transitions"):
+        material["transitions"] = proposal["transitions"]
     encoded = json.dumps(
         material,
         ensure_ascii=False,
@@ -322,6 +337,15 @@ def _render_group_walking(group: Mapping[str, Any]) -> list[str]:
             lines.append(f"- **路网评估**：{status}（{reason}）")
         else:
             lines.append("- **预计步行时间**：未取得路网用时")
+    access = group.get("access")
+    if isinstance(access, Mapping):
+        for key, label in (("entry", "进站"), ("exit", "出站")):
+            item = access.get(key)
+            if isinstance(item, Mapping) and item.get("station"):
+                lines.append(
+                    f"- **{label}**：{_markdown_text(str(item['station']))}"
+                    f"（步行约 {_format_distance(item.get('walkMeters'))}）"
+                )
     return lines
 
 

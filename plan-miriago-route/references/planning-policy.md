@@ -10,8 +10,9 @@ detailed planning.
 ## Local deterministic method
 
 1. Validate coordinates and set unusable points aside.
-2. Bundle points within 12–20 metres so duplicate or near-identical scenes do
-   not distort density.
+2. Bundle points within 12–20 metres (or `--bundle-meters`, up to 200) by
+   complete linkage, so every pair inside a stop is within the threshold and
+   points along a bridge or street never chain into one huge stop.
 3. Compute pairwise great-circle (Haversine) distances.
 4. Estimate each stop's local scale from nearby neighbors.
 5. Build a minimum spanning tree over mutual-reachability distance.
@@ -21,8 +22,9 @@ detailed planning.
    limits.
 8. Merge adjacent small results only when the combined group still satisfies
    every hard limit.
-9. Order groups by medoids and order each group's stops with a deterministic
-   nearest-neighbor plus 2-opt open path.
+9. Order groups by medoids and order each group's stops as an open path: exact
+   for up to 9 stops, otherwise deterministic multi-start cheapest insertion
+   with 2-opt and Or-opt moves.
 
 This adapts to dense city centers and sparse outskirts without asking for a
 fixed group count.
@@ -37,12 +39,34 @@ fixed group count.
 
 These are first-pass guardrails, not promises about actual walking distance.
 
+## Day-route strategy
+
+The optional `day-route` module plans route areas instead of density clusters:
+each pool is one optimised walk with fixed, station, or summit ends and via
+points, cut into days and then into contiguous areas by exact dynamic
+programming. Neighbouring areas share a boundary stop, so the plan cannot
+contain crossing areas or a detour back to one far point. See
+[day-route-config.md](day-route-config.md).
+
+## Special groups
+
+`restricted` groups (sites open only on special days) and `unverified` groups
+(locations nobody could confirm) keep their points in the package but are
+never routed; road-network refinement records them as skipped.
+
 ## Distance interpretation
 
 - `directPathMeters`: sum of Haversine segments along the local order.
 - `roughWalkingMeters`: `directPathMeters × 1.25`.
-- `walkingPathMeters`: street-network matrix result, present only after
-  successful Valhalla refinement.
+- `plannedWalkingMeters`: day-route planning estimate on the chosen backend,
+  including the leg from the previous area or start station.
+- `walkingPathMeters`: street-network result, present only after successful
+  refinement (Valhalla or offline OSM) at the approved policy.
+
+Network matrices get two corrections. A leg shorter than 150 m in a straight
+line is capped at `1.5 × straight + 30` m, because OpenStreetMap often lacks
+paths inside stations, shrines, and parks — unless the straight segment
+crosses mapped water. Snap offsets beyond 15 m are added to the distance.
 
 The 1.25 factor is an explicitly labeled heuristic. Rivers, rail yards,
 expressways, restricted sites, elevation, and building entrances can make it
@@ -57,18 +81,28 @@ After area approval and before route planning, obtain two explicit decisions:
 
 Recommend road-network evaluation and present `yes` as the default choice, but
 never infer it from silence or continue in the same response that asks. Record
-both decisions with `confirm-route-policy`. This workflow does not select a
+the decisions with `confirm-route-policy`, including the network backend and,
+with the `stations-assist` module, whether stations are planned. This workflow does not select a
 driving or other travel model.
 
 When road-network evaluation is accepted, every current group needs persisted
 evidence before final route confirmation. Evidence is one of:
 
 - `routed`, with the evaluated point order, walking distance, and duration;
-- `skipped`, with a structural reason such as a singleton or matrix size limit;
+- `skipped`, with a structural reason such as a singleton, a special group, or
+  the Valhalla size limit;
 - `failed`, with the public-service failure reason.
 
-A changed point order or membership invalidates evidence for that group. Refine
-it again before route confirmation. Present every skip and failure to the user;
+A changed point order, membership, or route end invalidates evidence for that
+group. Refine it again before route confirmation.
+
+## Route quality
+
+Refinement and day-route planning report, per area, straight-line
+self-crossings of the visit order, single-point detours (a stop of at most two
+points whose removal saves 400 m or more and most of its access walk), and the
+share of the route geometry walked twice. Present every flag at the area or
+route gate; they are review cues, not automatic changes. Present every skip and failure to the user;
 evidence records the limitation and does not turn it into an accurate distance.
 
 ## Time-based tradeoffs
@@ -79,7 +113,10 @@ Flag isolated groups, large detours, and points far from the rest, then show the
 specific effect of keeping or excluding them.
 
 Exclude a point only after the user approves both its ID and a non-empty reason.
-Store the decision in `excludedPoints` with its prior group and order. Remove it
+Store the decision in `excludedPoints` (kind `time_tradeoff`) with its prior
+group and order. Removals from an interactive review are kind `curation`
+instead: they need the curation gate, not a time policy, and `apply-review`
+restores them when the user withdraws the decision. Remove it
 from route membership, but keep the complete point in the plan with no group
 assignment. Never use `unassignedPointIds` for this purpose; that field remains
 reserved for invalid or pending coordinates.
@@ -98,11 +135,15 @@ any decision themselves.
   evaluations.
 - Gray dashed lines are visit-order straight-line approximations.
 - Orange dashed lines mark unavailable road geometry or failed evaluation.
+- Solid colored lines without routed evidence are `planned` day-route shapes.
+- Square markers are stations; purple dashed lines are rail transfer candidates.
 - Red crosses identify excluded points without exposing their stored reasons.
 - The sidebar lists invalid or pending-coordinate points that cannot be mapped.
 
 The compact HTML intentionally omits notes, images, source links, exclusion
-reasons, and service diagnostics. Keep the full written gate report authoritative.
+reasons, and service diagnostics. The optional review mode adds images, links,
+hints, and decisions for curation. Keep the full written gate report
+authoritative in both modes.
 Regenerate the preview after membership, order, evaluation, or exclusion changes.
 
 ## Agent review cues
